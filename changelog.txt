@@ -1,0 +1,10 @@
+『 Thermal Breaker Miyabi Core v2.2.0 』
+
+v2.2.0
+
+- Fixed duplicate module installation issue
+- Improved thermal service override handling
+- Reduced thermal service restart loop
+- Refined MSM thermal disable logic
+- Stability improvement
+

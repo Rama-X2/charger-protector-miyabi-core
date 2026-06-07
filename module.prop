@@ -1,6 +1,6 @@
-id=miyabi-charge-protector
-name=Miyabi Charge Protector
-version=1.0.0
-versionCode=100
+id=charger-protector-miyabi-core
+name=Charger Protector Miyabi Core
+version=0.0.1
+versionCode=001
 author=Rama-X2
-description=Battery charge limiter 90/70 with auto node detection
+description=Universal Charge Protection Engine
