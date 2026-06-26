@@ -1,0 +1,9 @@
+『 Charger Protector Miyabi Core v1.0.0 』
+
+v1.0.0
+- Initial stable release of the Universal Battery Charge Protection Engine.
+- Re-architected code structure into system/bin/miyabi-charger.
+- Implemented lightweight, low-overhead daemon utilizing shell builtins (read -r).
+- Added smart state detection to prevent redundant writes to sysfs charging nodes.
+- Designed interactive terminal CLI dashboard for real-time monitoring and custom levels.
+- Created JSON Status API (miyabi-charger status-json) for companion app integration.

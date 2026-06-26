@@ -1,0 +1,765 @@
+#!/system/bin/sh
+# ==========================================
+# Miyabi Charger Protector CLI & Daemon
+# Author: Rama-X2 & Antigravity
+# ==========================================
+
+BASE="/data/adb/miyabi-core/charger"
+CONFIG="$BASE/config.conf"
+CACHE="$BASE/node.cache"
+LOG="$BASE/log.txt"
+
+# Default config fallback
+STOP_LEVEL=90
+RESUME_LEVEL=70
+ENABLED=1
+SLEEP_PLUGGED=15
+SLEEP_UNPLUGGED=45
+MANUAL_CONTROL=0
+MANUAL_STATE=1
+NODE_PATH=""
+
+# ANSI Colors for premium terminal UI
+C_RESET="\033[0m"
+C_BOLD="\033[1m"
+C_RED="\033[1;31m"
+C_GREEN="\033[1;32m"
+C_YELLOW="\033[1;33m"
+C_BLUE="\033[1;34m"
+C_CYAN="\033[1;36m"
+C_GRAY="\033[0;90m"
+
+# Ensure BASE directory exists
+mkdir -p "$BASE"
+
+# Helper to read sysfs safely
+read_sysfs() {
+    local val=""
+    if [ -f "$1" ]; then
+        read -r val < "$1"
+    fi
+    echo "$val"
+}
+
+# Load config
+load_config() {
+    if [ -f "$CONFIG" ]; then
+        . "$CONFIG"
+    fi
+}
+
+# Save config
+save_config() {
+    cat <<EOF > "$CONFIG"
+STOP_LEVEL=$STOP_LEVEL
+RESUME_LEVEL=$RESUME_LEVEL
+ENABLED=$ENABLED
+SLEEP_PLUGGED=$SLEEP_PLUGGED
+SLEEP_UNPLUGGED=$SLEEP_UNPLUGGED
+MANUAL_CONTROL=$MANUAL_CONTROL
+MANUAL_STATE=$MANUAL_STATE
+NODE_PATH="$NODE_PATH"
+EOF
+    chmod 644 "$CONFIG"
+}
+
+# Log helper
+log_msg() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "$LOG"
+    # Keep log file size reasonable (max 1000 lines)
+    if [ "$(wc -l < "$LOG" 2>/dev/null || echo 0)" -gt 1000 ]; then
+        tail -n 500 "$LOG" > "${LOG}.tmp" && mv "${LOG}.tmp" "$LOG"
+    fi
+}
+
+# Robust Charging Node Finder
+find_node() {
+    if [ -n "$NODE_PATH" ] && [ -f "$NODE_PATH" ]; then
+        echo "$NODE_PATH"
+        return
+    fi
+    if [ -f "$CACHE" ]; then
+        local cached_node=""
+        read -r cached_node < "$CACHE"
+        if [ -n "$cached_node" ] && [ -f "$cached_node" ]; then
+            echo "$cached_node"
+            return
+        fi
+    fi
+
+    # Scan list of potential sysfs charge control nodes in order of reliability
+    for node in \
+        /sys/class/power_supply/battery/charging_enabled \
+        /sys/class/power_supply/battery/input_suspend \
+        /sys/class/power_supply/battery/battery_charging_enabled \
+        /sys/class/power_supply/battery/charge_disable \
+        /sys/class/power_supply/battery/op_charging_enabled \
+        /sys/class/power_supply/battery/mmi_charging_enable \
+        /sys/class/power_supply/battery/store_mode \
+        /sys/class/power_supply/battery/charge_control_limit
+    do
+        if [ -f "$node" ]; then
+            echo "$node" > "$CACHE"
+            echo "$node"
+            return
+        fi
+    done
+}
+
+# Get Node Expected Values
+get_node_values() {
+    local node="$1"
+    local state="$2" # "enable" or "disable"
+    case "$(basename "$node")" in
+        input_suspend|charge_disable|store_mode)
+            [ "$state" = "disable" ] && echo "1" || echo "0"
+            ;;
+        charging_enabled|battery_charging_enabled|op_charging_enabled|mmi_charging_enable|charge_control_limit)
+            [ "$state" = "disable" ] && echo "0" || echo "1"
+            ;;
+        *)
+            [ "$state" = "disable" ] && echo "0" || echo "1"
+            ;;
+    esac
+}
+
+# Apply Charging State to Node (smart write, avoids lag/spam)
+set_charging_state() {
+    local target_state="$1" # "enable" or "disable"
+    local node
+    node=$(find_node)
+    [ -z "$node" ] && return 1
+
+    local expected_val
+    expected_val=$(get_node_values "$node" "$target_state")
+
+    local raw_val=""
+    read -r raw_val < "$node"
+
+    if [ "$raw_val" != "$expected_val" ]; then
+        echo "$expected_val" > "$node" 2>/dev/null
+        local status=$?
+        if [ $status -eq 0 ]; then
+            log_msg "Changed charging state to $target_state (node: $(basename "$node"), val: $expected_val)"
+            return 0
+        else
+            log_msg "Failed to write $expected_val to $node"
+            return 1
+        fi
+    fi
+    return 0
+}
+
+# Check if plugged in (cable connected)
+is_plugged_in() {
+    local plugged=0
+    for ps in /sys/class/power_supply/*; do
+        [ -d "$ps" ] || continue
+        [ "$(basename "$ps")" = "battery" ] && continue
+        if [ -f "$ps/online" ]; then
+            read -r online < "$ps/online"
+            if [ "$online" = "1" ]; then
+                plugged=1
+                break
+            fi
+        fi
+    done
+    
+    # Fallback to battery status
+    if [ "$plugged" -eq 0 ]; then
+        local status
+        status=$(read_sysfs /sys/class/power_supply/battery/status)
+        if [ "$status" = "Charging" ] || [ "$status" = "Full" ]; then
+            plugged=1
+        fi
+    fi
+    return $(( ! plugged ))
+}
+
+# Check if daemon process is currently running
+is_daemon_running() {
+    local pid
+    pid=$(pgrep -f "miyabi-charger daemon")
+    for p in $pid; do
+        if [ "$p" -ne "$$" ]; then
+            return 0 # Running
+        fi
+    done
+    return 1 # Not running
+}
+
+# Format temperature
+get_battery_temp() {
+    local raw_temp
+    raw_temp=$(read_sysfs /sys/class/power_supply/battery/temp)
+    if [ -n "$raw_temp" ]; then
+        if [ "$raw_temp" -gt 1000 ]; then
+            # e.g., 35800 -> 35.8
+            echo "$((raw_temp / 1000)).$(( (raw_temp % 1000) / 100 ))"
+        elif [ "$raw_temp" -gt 100 ]; then
+            # e.g., 358 -> 35.8
+            echo "$((raw_temp / 10)).$((raw_temp % 10))"
+        else
+            echo "$raw_temp"
+        fi
+    else
+        echo "N/A"
+    fi
+}
+
+# Format voltage
+get_battery_vol() {
+    local raw_vol
+    raw_vol=$(read_sysfs /sys/class/power_supply/battery/voltage_now)
+    [ -z "$raw_vol" ] && raw_vol=$(read_sysfs /sys/class/power_supply/battery/batt_vol)
+    if [ -n "$raw_vol" ]; then
+        if [ "$raw_vol" -gt 10000 ]; then
+            # e.g. 4055000 -> 4.055
+            local vol_dec=$((raw_vol / 1000000))
+            local vol_frac=$(( (raw_vol % 1000000) / 1000 ))
+            while [ ${#vol_frac} -lt 3 ]; do vol_frac="0$vol_frac"; done
+            echo "${vol_dec}.${vol_frac}"
+        else
+            echo "$raw_vol"
+        fi
+    else
+        echo "N/A"
+    fi
+}
+
+# Format current (mA)
+get_battery_curr() {
+    local raw_curr
+    raw_curr=$(read_sysfs /sys/class/power_supply/battery/current_now)
+    if [ -n "$raw_curr" ]; then
+        if [ "$raw_curr" -gt 1000 ] || [ "$raw_curr" -lt -1000 ]; then
+            echo "$((raw_curr / 1000))"
+        else
+            echo "$raw_curr"
+        fi
+    else
+        echo "N/A"
+    fi
+}
+
+# Get Current Charging Control State
+get_charging_state() {
+    local node
+    node=$(find_node)
+    [ -z "$node" ] && echo "Unknown" && return
+    
+    local val=""
+    read -r val < "$node"
+    
+    local disabled_val
+    disabled_val=$(get_node_values "$node" "disable")
+    
+    if [ "$val" = "$disabled_val" ]; then
+        echo "Disabled"
+    else
+        echo "Enabled"
+    fi
+}
+
+# JSON Status Output for Monitor App
+print_json_status() {
+    load_config
+    local level
+    level=$(read_sysfs /sys/class/power_supply/battery/capacity)
+    [ -z "$level" ] && level=0
+    
+    local status
+    status=$(read_sysfs /sys/class/power_supply/battery/status)
+    [ -z "$status" ] && status="Unknown"
+    
+    local temp
+    temp=$(get_battery_temp)
+    
+    local vol
+    vol=$(get_battery_vol)
+    
+    local curr
+    curr=$(get_battery_curr)
+    
+    local cycle
+    cycle=$(read_sysfs /sys/class/power_supply/battery/cycle_count)
+    [ -z "$cycle" ] && cycle="0"
+    
+    local node
+    node=$(find_node)
+    [ -z "$node" ] && node="none"
+    
+    local node_val=""
+    [ "$node" != "none" ] && read -r node_val < "$node"
+    [ -z "$node_val" ] && node_val="null"
+    
+    local d_run=0
+    is_daemon_running && d_run=1
+    
+    local plugged=0
+    is_plugged_in && plugged=1
+    
+    local charging_state
+    charging_state=$(get_charging_state)
+
+    cat <<EOF
+{"battery_level":$level,"battery_status":"$status","temperature_c":$temp,"voltage_v":$vol,"current_ma":$curr,"cycle_count":$cycle,"node_path":"$node","node_value":$node_val,"charging_state":"$charging_state","protection_enabled":$ENABLED,"stop_level":$STOP_LEVEL,"resume_level":$RESUME_LEVEL,"manual_control":$MANUAL_CONTROL,"manual_state":$MANUAL_STATE,"daemon_running":$d_run,"plugged_in":$plugged}
+EOF
+}
+
+# The Daemon Core Loop (Low Overhead)
+run_daemon() {
+    log_msg "Miyabi Charger Protection daemon started (PID: $$)"
+    
+    while true; do
+        # Reload configuration parameters at each iteration
+        load_config
+        
+        if [ "$ENABLED" -ne 1 ]; then
+            # If engine is disabled, ensure charging is enabled and sleep
+            set_charging_state "enable"
+            sleep "$SLEEP_UNPLUGGED"
+            continue
+        fi
+        
+        if [ "$MANUAL_CONTROL" -eq 1 ]; then
+            # Manual override mode
+            if [ "$MANUAL_STATE" -eq 1 ]; then
+                set_charging_state "enable"
+            else
+                set_charging_state "disable"
+            fi
+            sleep "$SLEEP_PLUGGED"
+            continue
+        fi
+        
+        # Automatic protection mode
+        if is_plugged_in; then
+            # Read battery capacity (percentage)
+            local cap=""
+            read -r cap < /sys/class/power_supply/battery/capacity
+            
+            if [ -n "$cap" ]; then
+                if [ "$cap" -ge "$STOP_LEVEL" ]; then
+                    set_charging_state "disable"
+                elif [ "$cap" -le "$RESUME_LEVEL" ]; then
+                    set_charging_state "enable"
+                fi
+            fi
+            sleep "$SLEEP_PLUGGED"
+        else
+            # Unplugged: Safety reset charging to enabled & sleep longer to conserve resources
+            set_charging_state "enable"
+            sleep "$SLEEP_UNPLUGGED"
+        fi
+    done
+}
+
+# Interactive CLI Dashboard
+show_dashboard() {
+    while true; do
+        load_config
+        local level
+        level=$(read_sysfs /sys/class/power_supply/battery/capacity)
+        local status
+        status=$(read_sysfs /sys/class/power_supply/battery/status)
+        local temp
+        temp=$(get_battery_temp)
+        local vol
+        vol=$(get_battery_vol)
+        local curr
+        curr=$(get_battery_curr)
+        local node
+        node=$(find_node)
+        local charge_state
+        charge_state=$(get_charging_state)
+        
+        local d_status="${C_RED}Stopped${C_RESET}"
+        is_daemon_running && d_status="${C_GREEN}Running${C_RESET}"
+        
+        local p_status="${C_RED}Disabled${C_RESET}"
+        [ "$ENABLED" -eq 1 ] && p_status="${C_GREEN}Enabled${C_RESET}"
+
+        local m_status="Auto"
+        if [ "$MANUAL_CONTROL" -eq 1 ]; then
+            [ "$MANUAL_STATE" -eq 1 ] && m_status="${C_YELLOW}Manual (Force Charge)${C_RESET}" || m_status="${C_YELLOW}Manual (Force Stop)${C_RESET}"
+        fi
+
+        clear
+        echo -e "${C_CYAN}====================================================${C_RESET}"
+        echo -e "${C_BOLD}   MIYABI CHARGER PROTECTOR DASHBOARD${C_RESET}"
+        echo -e "${C_CYAN}====================================================${C_RESET}"
+        echo -e " ${C_BOLD}Battery Status:${C_RESET}"
+        echo -e "   Level       : ${C_GREEN}${level}%${C_RESET} (${status})"
+        echo -e "   Temp        : ${temp}°C"
+        echo -e "   Voltage     : ${vol}V"
+        echo -e "   Current     : ${curr}mA"
+        echo -e "   Plugged In  : $(is_plugged_in && echo -e "${C_GREEN}Yes${C_RESET}" || echo -e "${C_RED}No${C_RESET}")"
+        echo -e "${C_GRAY}----------------------------------------------------${C_RESET}"
+        echo -e " ${C_BOLD}Protection Engine:${C_RESET}"
+        echo -e "   Daemon      : ${d_status}"
+        echo -e "   Protection  : ${p_status}"
+        echo -e "   Control Mode: ${m_status}"
+        echo -e "   Stop Level  : ${C_YELLOW}${STOP_LEVEL}%${C_RESET}"
+        echo -e "   Resume Level: ${C_YELLOW}${RESUME_LEVEL}%${C_RESET}"
+        echo -e "   Active Node : ${C_BLUE}${node:-None}${C_RESET} (${charge_state})"
+        echo -e "${C_CYAN}====================================================${C_RESET}"
+        echo -e " ${C_BOLD}Options:${C_RESET}"
+        echo -e "  [1] Toggle Protection Engine (${p_status})"
+        echo -e "  [2] Set Stop Charge Percentage"
+        echo -e "  [3] Set Resume Charge Percentage"
+        echo -e "  [4] Manual Control Override"
+        echo -e "  [5] Diagnose / Select Charge Node"
+        echo -e "  [6] View Logs"
+        echo -e "  [Q] Quit"
+        echo -e "${C_CYAN}====================================================${C_RESET}"
+        echo -n -e " Enter choice: "
+        read -r choice
+        
+        case "$choice" in
+            1)
+                if [ "$ENABLED" -eq 1 ]; then
+                    ENABLED=0
+                    echo "Disabling protection..."
+                else
+                    ENABLED=1
+                    echo "Enabling protection..."
+                fi
+                save_config
+                sleep 1
+                ;;
+            2)
+                echo -n "Enter stop percentage (10-100): "
+                read -r input_stop
+                if [ "$input_stop" -ge 10 ] && [ "$input_stop" -le 100 ] 2>/dev/null; then
+                    if [ "$input_stop" -le "$RESUME_LEVEL" ]; then
+                        echo -e "${C_RED}Error: Stop percentage must be higher than Resume percentage ($RESUME_LEVEL%).${C_RESET}"
+                        read -r _
+                    else
+                        STOP_LEVEL=$input_stop
+                        save_config
+                    fi
+                else
+                    echo -e "${C_RED}Invalid percentage.${C_RESET}"
+                    read -r _
+                fi
+                ;;
+            3)
+                echo -n "Enter resume percentage (5-95): "
+                read -r input_resume
+                if [ "$input_resume" -ge 5 ] && [ "$input_resume" -le 95 ] 2>/dev/null; then
+                    if [ "$input_resume" -ge "$STOP_LEVEL" ]; then
+                        echo -e "${C_RED}Error: Resume percentage must be lower than Stop percentage ($STOP_LEVEL%).${C_RESET}"
+                        read -r _
+                    else
+                        RESUME_LEVEL=$input_resume
+                        save_config
+                    fi
+                else
+                    echo -e "${C_RED}Invalid percentage.${C_RESET}"
+                    read -r _
+                fi
+                ;;
+            4)
+                show_manual_override_menu
+                ;;
+            5)
+                show_diagnostic_menu
+                ;;
+            6)
+                clear
+                echo "=== LATEST ENGINE LOGS ==="
+                if [ -f "$LOG" ]; then
+                    tail -n 30 "$LOG"
+                else
+                    echo "No logs found."
+                fi
+                echo "Press enter to go back..."
+                read -r _
+                ;;
+            q|Q)
+                break
+                ;;
+        esac
+    done
+}
+
+# Manual Control Override Sub-menu
+show_manual_override_menu() {
+    while true; do
+        load_config
+        clear
+        echo -e "${C_CYAN}====================================================${C_RESET}"
+        echo -e "${C_BOLD}   MANUAL CHARGING OVERRIDE CONTROL${C_RESET}"
+        echo -e "${C_CYAN}====================================================${C_RESET}"
+        echo -e " Current Mode: $([ "$MANUAL_CONTROL" -eq 1 ] && echo -e "${C_YELLOW}Manual${C_RESET}" || echo -e "${C_GREEN}Auto (Recommended)${C_RESET}")"
+        if [ "$MANUAL_CONTROL" -eq 1 ]; then
+            echo -e " Force State : $([ "$MANUAL_STATE" -eq 1 ] && echo -e "${C_GREEN}Charging Enabled${C_RESET}" || echo -e "${C_RED}Charging Disabled${C_RESET}")"
+        fi
+        echo -e "${C_GRAY}----------------------------------------------------${C_RESET}"
+        echo -e " [1] Force Disable Charging (Manual Stop)"
+        echo -e " [2] Force Enable Charging (Manual Charge)"
+        echo -e " [3] Restore Auto Control (Default)"
+        echo -e " [B] Back"
+        echo -e "${C_CYAN}====================================================${C_RESET}"
+        echo -n " Enter choice: "
+        read -r mchoice
+        
+        case "$mchoice" in
+            1)
+                MANUAL_CONTROL=1
+                MANUAL_STATE=0
+                save_config
+                set_charging_state "disable"
+                echo "Charging force disabled."
+                sleep 1
+                ;;
+            2)
+                MANUAL_CONTROL=1
+                MANUAL_STATE=1
+                save_config
+                set_charging_state "enable"
+                echo "Charging force enabled."
+                sleep 1
+                ;;
+            3)
+                MANUAL_CONTROL=0
+                save_config
+                echo "Auto control restored."
+                sleep 1
+                return
+                ;;
+            b|B)
+                return
+                ;;
+        esac
+    done
+}
+
+# Diagnostic and Node Selection Sub-menu
+show_diagnostic_menu() {
+    while true; do
+        load_config
+        local current_node
+        current_node=$(find_node)
+        clear
+        echo -e "${C_CYAN}====================================================${C_RESET}"
+        echo -e "${C_BOLD}   DIAGNOSE & SELECT CHARGING NODE${C_RESET}"
+        echo -e "${C_CYAN}====================================================${C_RESET}"
+        echo -e " Active Node : ${C_BLUE}${current_node:-None}${C_RESET}"
+        echo -e " Node Val    : $([ -n "$current_node" ] && read_sysfs "$current_node" || echo "N/A")"
+        echo -e "${C_GRAY}----------------------------------------------------${C_RESET}"
+        echo -e " Found nodes on this device:"
+        
+        local idx=1
+        local nodes_found=""
+        for n in \
+            /sys/class/power_supply/battery/charging_enabled \
+            /sys/class/power_supply/battery/input_suspend \
+            /sys/class/power_supply/battery/battery_charging_enabled \
+            /sys/class/power_supply/battery/charge_disable \
+            /sys/class/power_supply/battery/op_charging_enabled \
+            /sys/class/power_supply/battery/mmi_charging_enable \
+            /sys/class/power_supply/battery/store_mode \
+            /sys/class/power_supply/battery/charge_control_limit
+        do
+            if [ -f "$n" ]; then
+                local is_active=""
+                [ "$n" = "$current_node" ] && is_active=" ${C_GREEN}(Active)${C_RESET}"
+                echo -e "  [$idx] $(basename "$n")${is_active}"
+                nodes_found="$nodes_found $n"
+                idx=$((idx + 1))
+            fi
+        done
+        
+        if [ "$idx" -eq 1 ]; then
+            echo -e "  ${C_RED}No compatible charging nodes detected!${C_RESET}"
+        fi
+        
+        echo -e "${C_GRAY}----------------------------------------------------${C_RESET}"
+        echo -e " [T] Run Node Toggle Test (Will turn charging OFF for 5s, then ON)"
+        echo -e " [R] Reset to Auto-detected Node"
+        echo -e " [C] Custom Node Path Input"
+        echo -e " [B] Back"
+        echo -e "${C_CYAN}====================================================${C_RESET}"
+        echo -n " Enter index or option: "
+        read -r opt
+        
+        case "$opt" in
+            [1-9])
+                local select_idx=1
+                for n in $nodes_found; do
+                    if [ "$select_idx" -eq "$opt" ]; then
+                        NODE_PATH="$n"
+                        save_config
+                        rm -f "$CACHE"
+                        echo "Switched to node: $n"
+                        sleep 1
+                        break
+                    fi
+                    select_idx=$((select_idx + 1))
+                done
+                ;;
+            t|T)
+                if [ -n "$current_node" ]; then
+                    echo -e "\n${C_YELLOW}Testing Node Toggle:${C_RESET}"
+                    echo "1. Disabling charging for 5 seconds..."
+                    set_charging_state "disable"
+                    sleep 5
+                    echo "Current: $(get_battery_curr) mA (should be 0 or negative)"
+                    echo "2. Re-enabling charging..."
+                    set_charging_state "enable"
+                    sleep 2
+                    echo "Current: $(get_battery_curr) mA"
+                    echo "Test complete. Press enter to continue."
+                    read -r _
+                else
+                    echo "No active node to test."
+                    sleep 15
+                fi
+                ;;
+            r|R)
+                NODE_PATH=""
+                rm -f "$CACHE"
+                save_config
+                echo "Cleared custom node. Daemon will auto-detect."
+                sleep 1
+                ;;
+            c|C)
+                echo -n "Enter absolute sysfs path: "
+                read -r custom_path
+                if [ -f "$custom_path" ]; then
+                    NODE_PATH="$custom_path"
+                    save_config
+                    rm -f "$CACHE"
+                    echo "Set custom node path to: $custom_path"
+                else
+                    echo -e "${C_RED}File does not exist!${C_RESET}"
+                fi
+                sleep 1
+                ;;
+            b|B)
+                return
+                ;;
+        esac
+    done
+}
+
+# Command Line Dispatcher
+case "$1" in
+    daemon)
+        run_daemon
+        ;;
+    status)
+        load_config
+        echo "=== Miyabi Charger Protector Status ==="
+        echo "Battery level : $(read_sysfs /sys/class/power_supply/battery/capacity)%"
+        echo "Battery temp  : $(get_battery_temp)°C"
+        echo "Battery status: $(read_sysfs /sys/class/power_supply/battery/status)"
+        echo "Plugged in    : $(is_plugged_in && echo Yes || echo No)"
+        echo "Engine status : $([ "$ENABLED" -eq 1 ] && echo Enabled || echo Disabled)"
+        echo "Daemon status : $(is_daemon_running && echo Running || echo Stopped)"
+        echo "Stop level    : ${STOP_LEVEL}%"
+        echo "Resume level  : ${RESUME_LEVEL}%"
+        echo "Active Node   : $(find_node) ($(get_charging_state))"
+        ;;
+    status-json)
+        print_json_status
+        ;;
+    set-stop)
+        if [ -n "$2" ] && [ "$2" -ge 10 ] && [ "$2" -le 100 ] 2>/dev/null; then
+            load_config
+            if [ "$2" -le "$RESUME_LEVEL" ]; then
+                echo "Error: Stop level ($2) must be greater than Resume level ($RESUME_LEVEL)."
+                exit 1
+            fi
+            STOP_LEVEL="$2"
+            save_config
+            echo "Stop level set to $2%."
+        else
+            echo "Usage: miyabi-charger set-stop [10-100]"
+            exit 1
+        fi
+        ;;
+    set-resume)
+        if [ -n "$2" ] && [ "$2" -ge 5 ] && [ "$2" -le 95 ] 2>/dev/null; then
+            load_config
+            if [ "$2" -ge "$STOP_LEVEL" ]; then
+                echo "Error: Resume level ($2) must be less than Stop level ($STOP_LEVEL)."
+                exit 1
+            fi
+            RESUME_LEVEL="$2"
+            save_config
+            echo "Resume level set to $2%."
+        else
+            echo "Usage: miyabi-charger set-resume [5-95]"
+            exit 1
+        fi
+        ;;
+    enable)
+        load_config
+        ENABLED=1
+        save_config
+        echo "Miyabi Charger Protector enabled."
+        ;;
+    disable)
+        load_config
+        ENABLED=0
+        save_config
+        echo "Miyabi Charger Protector disabled."
+        ;;
+    force-stop)
+        load_config
+        MANUAL_CONTROL=1
+        MANUAL_STATE=0
+        save_config
+        set_charging_state "disable"
+        echo "Charging manually disabled."
+        ;;
+    force-resume)
+        load_config
+        MANUAL_CONTROL=1
+        MANUAL_STATE=1
+        save_config
+        set_charging_state "enable"
+        echo "Charging manually enabled."
+        ;;
+    auto)
+        load_config
+        MANUAL_CONTROL=0
+        save_config
+        echo "Returned to automatic control mode."
+        ;;
+    info)
+        load_config
+        cat <<EOF
+Discharge speed: $(get_battery_curr) mA
+Batt level: $(read_sysfs /sys/class/power_supply/battery/capacity)%
+Batt temp: $(get_battery_temp)°C
+Curr voltage: $(get_battery_vol) V
+Cycle times: $(read_sysfs /sys/class/power_supply/battery/cycle_count)
+EOF
+        ;;
+    help|--help|-h)
+        echo "Miyabi Charger Protector Commands:"
+        echo "  (no args)               Opens interactive dashboard"
+        echo "  status                  Displays current status"
+        echo "  status-json             Outputs status as JSON (for monitoring apps)"
+        echo "  info                    Displays bms information in text format"
+        echo "  enable                  Enables charge protection"
+        echo "  disable                 Disables charge protection"
+        echo "  set-stop <10-100>       Sets stop percentage"
+        echo "  set-resume <5-95>       Sets resume percentage"
+        echo "  force-stop              Force disables charging manually"
+        echo "  force-resume            Force enables charging manually"
+        echo "  auto                    Restores automatic percentage checking"
+        ;;
+    *)
+        # Default: open interactive UI if in tty, otherwise show help
+        if [ -t 0 ] || [ -t 1 ]; then
+            show_dashboard
+        else
+            $0 help
+        fi
+        ;;
+esac

@@ -1,0 +1,6 @@
+id=charger-protector-miyabi-core
+name=Charger Protector Miyabi Core
+version=1.0.0
+versionCode=100
+author=Rama-X2 & Antigravity
+description=Lightweight universal battery charge protection engine with interactive CLI dashboard and JSON status API.
