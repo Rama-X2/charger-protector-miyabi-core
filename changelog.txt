@@ -1,9 +1,11 @@
-『 Charger Protector Miyabi Core v1.0.0 』
+『 Charger Protector Miyabi Core v1.5.7 』
 
-v1.0.0
-- Initial stable release of the Universal Battery Charge Protection Engine.
-- Re-architected code structure into system/bin/miyabi-charger.
-- Implemented lightweight, low-overhead daemon utilizing shell builtins (read -r).
-- Added smart state detection to prevent redundant writes to sysfs charging nodes.
-- Designed interactive terminal CLI dashboard for real-time monitoring and custom levels.
-- Created JSON Status API (miyabi-charger status-json) for companion app integration.
+v1.5.7
+- Added MediaTek (MTK) charge control bypass support (/proc/mtk_battery_cmd/current_cmd)
+- Added support for /sys/class/power_supply/battery/disable control node
+- Added Status Bar charging icon hiding feature using dumpsys battery set usb 0
+- Implemented state cache (ICON_MOCKED) to prevent CPU lag from redundant dumpsys calls
+- Added Option [7] to toggle status bar icon visibility in CLI Dashboard
+- Optimized daemon loop using shell builtins (read -r) for zero-lag background execution
+- Fixed MODPATH directory referencing issues during module startup
+- Forced fresh node re-detection on module boot by clearing cache

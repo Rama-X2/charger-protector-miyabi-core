@@ -18,6 +18,7 @@ SLEEP_UNPLUGGED=45
 MANUAL_CONTROL=0
 MANUAL_STATE=1
 NODE_PATH=""
+HIDE_ICON=1
 
 # ANSI Colors for premium terminal UI
 C_RESET="\033[0m"
@@ -59,6 +60,7 @@ SLEEP_UNPLUGGED=$SLEEP_UNPLUGGED
 MANUAL_CONTROL=$MANUAL_CONTROL
 MANUAL_STATE=$MANUAL_STATE
 NODE_PATH="$NODE_PATH"
+HIDE_ICON=$HIDE_ICON
 EOF
     chmod 644 "$CONFIG"
 }
@@ -87,8 +89,9 @@ find_node() {
         fi
     fi
 
-    # Scan list of potential sysfs charge control nodes in order of reliability
+    # Scan list of potential sysfs/procfs charge control nodes in order of reliability
     for node in \
+        /proc/mtk_battery_cmd/current_cmd \
         /sys/class/power_supply/battery/charging_enabled \
         /sys/class/power_supply/battery/input_suspend \
         /sys/class/power_supply/battery/battery_charging_enabled \
@@ -96,7 +99,8 @@ find_node() {
         /sys/class/power_supply/battery/op_charging_enabled \
         /sys/class/power_supply/battery/mmi_charging_enable \
         /sys/class/power_supply/battery/store_mode \
-        /sys/class/power_supply/battery/charge_control_limit
+        /sys/class/power_supply/battery/charge_control_limit \
+        /sys/class/power_supply/battery/disable
     do
         if [ -f "$node" ]; then
             echo "$node" > "$CACHE"
@@ -111,7 +115,10 @@ get_node_values() {
     local node="$1"
     local state="$2" # "enable" or "disable"
     case "$(basename "$node")" in
-        input_suspend|charge_disable|store_mode)
+        current_cmd)
+            [ "$state" = "disable" ] && echo "0 1" || echo "0 0"
+            ;;
+        input_suspend|charge_disable|store_mode|disable)
             [ "$state" = "disable" ] && echo "1" || echo "0"
             ;;
         charging_enabled|battery_charging_enabled|op_charging_enabled|mmi_charging_enable|charge_control_limit)
@@ -121,6 +128,28 @@ get_node_values() {
             [ "$state" = "disable" ] && echo "0" || echo "1"
             ;;
     esac
+}
+
+# Keep track of mocked state in memory to avoid redundant dumpsys execution
+ICON_MOCKED=0
+
+hide_charging_icon() {
+    [ "$HIDE_ICON" -ne 1 ] && return
+    if [ "$ICON_MOCKED" -ne 1 ]; then
+        dumpsys battery set usb 0 >/dev/null 2>&1
+        dumpsys battery set ac 0 >/dev/null 2>&1
+        dumpsys battery set wireless 0 >/dev/null 2>&1
+        ICON_MOCKED=1
+        log_msg "Charging status bar icon hidden via dumpsys"
+    fi
+}
+
+show_charging_icon() {
+    if [ "$ICON_MOCKED" -ne 0 ]; then
+        dumpsys battery reset >/dev/null 2>&1
+        ICON_MOCKED=0
+        log_msg "Charging status bar icon restored via dumpsys"
+    fi
 }
 
 # Apply Charging State to Node (smart write, avoids lag/spam)
@@ -133,21 +162,38 @@ set_charging_state() {
     local expected_val
     expected_val=$(get_node_values "$node" "$target_state")
 
-    local raw_val=""
-    read -r raw_val < "$node"
-
-    if [ "$raw_val" != "$expected_val" ]; then
+    local write_success=0
+    # Bypass comparison for proc current_cmd to ensure write success
+    if [ "$(basename "$node")" = "current_cmd" ]; then
         echo "$expected_val" > "$node" 2>/dev/null
-        local status=$?
-        if [ $status -eq 0 ]; then
-            log_msg "Changed charging state to $target_state (node: $(basename "$node"), val: $expected_val)"
-            return 0
+        write_success=$?
+    else
+        local raw_val=""
+        read -r raw_val < "$node"
+        if [ "$raw_val" != "$expected_val" ]; then
+            echo "$expected_val" > "$node" 2>/dev/null
+            write_success=$?
+            if [ $write_success -eq 0 ]; then
+                log_msg "Changed charging state to $target_state (node: $(basename "$node"), val: $expected_val)"
+            else
+                log_msg "Failed to write $expected_val to $node"
+            fi
         else
-            log_msg "Failed to write $expected_val to $node"
-            return 1
+            write_success=0
         fi
     fi
-    return 0
+
+    # Trigger status bar icon mock if write was successful
+    if [ $write_success -eq 0 ]; then
+        if [ "$target_state" = "disable" ]; then
+            hide_charging_icon
+        else
+            show_charging_icon
+        fi
+        return 0
+    else
+        return 1
+    fi
 }
 
 # Check if plugged in (cable connected)
@@ -248,6 +294,23 @@ get_charging_state() {
     node=$(find_node)
     [ -z "$node" ] && echo "Unknown" && return
     
+    if [ "$(basename "$node")" = "current_cmd" ]; then
+        local content
+        content=$(cat "$node" 2>/dev/null)
+        if echo "$content" | grep -q "0 1" 2>/dev/null || [ "$content" = "0 1" ]; then
+            echo "Disabled"
+            return
+        fi
+        local curr
+        curr=$(get_battery_curr)
+        if is_plugged_in && [ "$curr" != "N/A" ] && [ "$curr" -le 10 ] && [ "$curr" -ge -50 ]; then
+             echo "Disabled"
+             return
+        fi
+        echo "Enabled"
+        return
+    fi
+    
     local val=""
     read -r val < "$node"
     
@@ -303,7 +366,7 @@ print_json_status() {
     charging_state=$(get_charging_state)
 
     cat <<EOF
-{"battery_level":$level,"battery_status":"$status","temperature_c":$temp,"voltage_v":$vol,"current_ma":$curr,"cycle_count":$cycle,"node_path":"$node","node_value":$node_val,"charging_state":"$charging_state","protection_enabled":$ENABLED,"stop_level":$STOP_LEVEL,"resume_level":$RESUME_LEVEL,"manual_control":$MANUAL_CONTROL,"manual_state":$MANUAL_STATE,"daemon_running":$d_run,"plugged_in":$plugged}
+{"battery_level":$level,"battery_status":"$status","temperature_c":$temp,"voltage_v":$vol,"current_ma":$curr,"cycle_count":$cycle,"node_path":"$node","node_value":$node_val,"charging_state":"$charging_state","protection_enabled":$ENABLED,"stop_level":$STOP_LEVEL,"resume_level":$RESUME_LEVEL,"manual_control":$MANUAL_CONTROL,"manual_state":$MANUAL_STATE,"daemon_running":$d_run,"plugged_in":$plugged,"hide_icon":$HIDE_ICON}
 EOF
 }
 
@@ -385,6 +448,9 @@ show_dashboard() {
             [ "$MANUAL_STATE" -eq 1 ] && m_status="${C_YELLOW}Manual (Force Charge)${C_RESET}" || m_status="${C_YELLOW}Manual (Force Stop)${C_RESET}"
         fi
 
+        local h_status="${C_RED}Disabled${C_RESET}"
+        [ "$HIDE_ICON" -eq 1 ] && h_status="${C_GREEN}Enabled${C_RESET}"
+
         clear
         echo -e "${C_CYAN}====================================================${C_RESET}"
         echo -e "${C_BOLD}   MIYABI CHARGER PROTECTOR DASHBOARD${C_RESET}"
@@ -395,6 +461,7 @@ show_dashboard() {
         echo -e "   Voltage     : ${vol}V"
         echo -e "   Current     : ${curr}mA"
         echo -e "   Plugged In  : $(is_plugged_in && echo -e "${C_GREEN}Yes${C_RESET}" || echo -e "${C_RED}No${C_RESET}")"
+
         echo -e "${C_GRAY}----------------------------------------------------${C_RESET}"
         echo -e " ${C_BOLD}Protection Engine:${C_RESET}"
         echo -e "   Daemon      : ${d_status}"
@@ -402,6 +469,7 @@ show_dashboard() {
         echo -e "   Control Mode: ${m_status}"
         echo -e "   Stop Level  : ${C_YELLOW}${STOP_LEVEL}%${C_RESET}"
         echo -e "   Resume Level: ${C_YELLOW}${RESUME_LEVEL}%${C_RESET}"
+        echo -e "   Hide Icon   : ${h_status}"
         echo -e "   Active Node : ${C_BLUE}${node:-None}${C_RESET} (${charge_state})"
         echo -e "${C_CYAN}====================================================${C_RESET}"
         echo -e " ${C_BOLD}Options:${C_RESET}"
@@ -411,6 +479,7 @@ show_dashboard() {
         echo -e "  [4] Manual Control Override"
         echo -e "  [5] Diagnose / Select Charge Node"
         echo -e "  [6] View Logs"
+        echo -e "  [7] Toggle Hide Charging Icon (${h_status})"
         echo -e "  [Q] Quit"
         echo -e "${C_CYAN}====================================================${C_RESET}"
         echo -n -e " Enter choice: "
@@ -476,6 +545,22 @@ show_dashboard() {
                 fi
                 echo "Press enter to go back..."
                 read -r _
+                ;;
+            7)
+                if [ "$HIDE_ICON" -eq 1 ]; then
+                    HIDE_ICON=0
+                    show_charging_icon
+                    echo "Disabling Hide Icon feature..."
+                else
+                    HIDE_ICON=1
+                    # If charging is currently disabled, apply immediately
+                    if [ "$(get_charging_state)" = "Disabled" ]; then
+                        hide_charging_icon
+                    fi
+                    echo "Enabling Hide Icon feature..."
+                fi
+                save_config
+                sleep 1
                 ;;
             q|Q)
                 break

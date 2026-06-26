@@ -71,6 +71,25 @@ Jika ingin mengabaikan mode otomatis dan mengontrol pengisian daya secara paksa:
   su -c miyabi-charger disable
   ```
 
+### 5. Mengatur Custom Charging Node (Jalur Kontrol Kustom)
+Secara bawaan, engine akan mendeteksi node pengontrol arus yang cocok secara otomatis. Namun, jika Anda ingin menyetel jalur file kontrol daya kustom secara manual (misalnya untuk kernel kustom):
+
+1. Buka dashboard utama:
+   ```bash
+   su -c miyabi-charger
+   ```
+2. Pilih menu **`5`** (`Diagnose / Select Charge Node`).
+3. Pilih opsi **`C`** (`Custom Node Path Input`).
+4. Masukkan jalur file kontrol daya HP Anda.
+
+**Contoh Jalur Node Umum:**
+* **Qualcomm Snapdragon**: `/sys/class/power_supply/battery/charging_enabled`
+* **MediaTek Bypass**: `/proc/mtk_battery_cmd/current_cmd`
+* **MediaTek/Xiaomi Alternatif**: `/sys/class/power_supply/battery/disable`
+* **Sony/Asus**: `/sys/class/power_supply/battery/input_suspend`
+
+*Tip: Anda bisa menggunakan menu **`T`** (`Run Node Toggle Test`) di dalam submenu tersebut untuk menguji secara langsung apakah jalur kustom yang Anda masukkan bekerja memutus arus pengisian atau tidak.*
+
 ---
 
 ## Integrasi dengan Aplikasi Monitoring (JSON API)
