@@ -27,7 +27,7 @@ print_modname() {
   ui_print "                     l、  ~ヽ                        "
   ui_print "                     じしf_, )ノ                     "
   busybox sleep 1
-  ui_print "    『 Charger Protector Miyabi Core v1.5.7 』     "
+  ui_print "    『 Charger Protector Miyabi Core v2.0.0 』     "
   busybox sleep 1
   ui_print "⢀⢀⢀⢀⢀⢀⢀⢀⢀⢀⢀⢀⢀⢀⢀⢀⢀⢀⢀⢀⢀⢀⢀⢀⢀⢀⢀⢀⢀⢀⢀⢀⢀⢀⢀⢀⢀⢀⢀"
   busybox sleep 1

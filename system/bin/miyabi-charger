@@ -63,6 +63,15 @@ NODE_PATH="$NODE_PATH"
 HIDE_ICON=$HIDE_ICON
 EOF
     chmod 644 "$CONFIG"
+    
+    # Notify daemon to reload and apply settings instantly
+    local pid
+    pid=$(pgrep -f "miyabi-charger daemon")
+    for p in $pid; do
+        if [ "$p" -ne "$$" ]; then
+            kill -USR1 "$p" 2>/dev/null
+        fi
+    done
 }
 
 # Log helper
@@ -201,7 +210,11 @@ is_plugged_in() {
     local plugged=0
     for ps in /sys/class/power_supply/*; do
         [ -d "$ps" ] || continue
-        [ "$(basename "$ps")" = "battery" ] && continue
+        local ps_name
+        ps_name=$(basename "$ps")
+        [ "$ps_name" = "battery" ] && continue
+        
+        # 1. Check online state
         if [ -f "$ps/online" ]; then
             read -r online < "$ps/online"
             if [ "$online" = "1" ]; then
@@ -209,10 +222,29 @@ is_plugged_in() {
                 break
             fi
         fi
+
+        # 2. Check present state (common on Qualcomm/Snapdragon VBUS)
+        if [ -f "$ps/present" ]; then
+            read -r present < "$ps/present"
+            if [ "$present" = "1" ]; then
+                plugged=1
+                break
+            fi
+        fi
+
+        # 3. Check voltage state as fallback (if VBUS > 4V, i.e., 4000mV or 4000000uV)
+        if [ -f "$ps/voltage_now" ] && { [ "$ps_name" = "usb" ] || [ "$ps_name" = "ac" ] || [ "$ps_name" = "main" ]; }; then
+            local vol_now=""
+            read -r vol_now < "$ps/voltage_now"
+            if [ -n "$vol_now" ] && [ "$vol_now" -gt 4000 ] 2>/dev/null; then
+                plugged=1
+                break
+            fi
+        fi
     done
     
-    # Fallback to battery status
-    if [ "$plugged" -eq 0 ]; then
+    # Fallback to battery status only if not currently mocked
+    if [ "$plugged" -eq 0 ] && [ "$ICON_MOCKED" -ne 1 ]; then
         local status
         status=$(read_sysfs /sys/class/power_supply/battery/status)
         if [ "$status" = "Charging" ] || [ "$status" = "Full" ]; then
@@ -370,9 +402,39 @@ print_json_status() {
 EOF
 }
 
+# Sleep helper that can be interrupted by signals instantly
+sleep_interruptible() {
+    local duration="$1"
+    sleep "$duration" &
+    wait $! 2>/dev/null
+}
+
+# Daemon cleanup on exit for safety
+cleanup() {
+    log_msg "Daemon exiting, restoring charging and icon state..."
+    # Disable traps to prevent recursion
+    trap - EXIT INT TERM USR1
+    
+    # Restore charging to enabled
+    local node
+    node=$(find_node)
+    if [ -n "$node" ]; then
+        local expected_val
+        expected_val=$(get_node_values "$node" "enable")
+        echo "$expected_val" > "$node" 2>/dev/null
+    fi
+    
+    # Restore battery status icon
+    dumpsys battery reset >/dev/null 2>&1
+}
+
 # The Daemon Core Loop (Low Overhead)
 run_daemon() {
     log_msg "Miyabi Charger Protection daemon started (PID: $$)"
+    
+    # Register signal traps
+    trap "load_config" USR1
+    trap "cleanup" EXIT INT TERM
     
     while true; do
         # Reload configuration parameters at each iteration
@@ -381,7 +443,7 @@ run_daemon() {
         if [ "$ENABLED" -ne 1 ]; then
             # If engine is disabled, ensure charging is enabled and sleep
             set_charging_state "enable"
-            sleep "$SLEEP_UNPLUGGED"
+            sleep_interruptible "$SLEEP_UNPLUGGED"
             continue
         fi
         
@@ -392,28 +454,30 @@ run_daemon() {
             else
                 set_charging_state "disable"
             fi
-            sleep "$SLEEP_PLUGGED"
+            sleep_interruptible "$SLEEP_PLUGGED"
             continue
         fi
         
         # Automatic protection mode
+        local cap=""
+        read -r cap < /sys/class/power_supply/battery/capacity
+        [ -z "$cap" ] && cap=0
+        
         if is_plugged_in; then
-            # Read battery capacity (percentage)
-            local cap=""
-            read -r cap < /sys/class/power_supply/battery/capacity
-            
-            if [ -n "$cap" ]; then
-                if [ "$cap" -ge "$STOP_LEVEL" ]; then
-                    set_charging_state "disable"
-                elif [ "$cap" -le "$RESUME_LEVEL" ]; then
-                    set_charging_state "enable"
-                fi
+            if [ "$cap" -ge "$STOP_LEVEL" ]; then
+                set_charging_state "disable"
+            elif [ "$cap" -le "$RESUME_LEVEL" ]; then
+                set_charging_state "enable"
             fi
-            sleep "$SLEEP_PLUGGED"
+            sleep_interruptible "$SLEEP_PLUGGED"
         else
-            # Unplugged: Safety reset charging to enabled & sleep longer to conserve resources
-            set_charging_state "enable"
-            sleep "$SLEEP_UNPLUGGED"
+            # Unplugged:
+            # ONLY enable charging if capacity drops to or below RESUME_LEVEL.
+            # Otherwise, keep current state (don't force enable) to prevent reconnect charging.
+            if [ "$cap" -le "$RESUME_LEVEL" ]; then
+                set_charging_state "enable"
+            fi
+            sleep_interruptible "$SLEEP_UNPLUGGED"
         fi
     done
 }
@@ -451,16 +515,24 @@ show_dashboard() {
         local h_status="${C_RED}Disabled${C_RESET}"
         [ "$HIDE_ICON" -eq 1 ] && h_status="${C_GREEN}Enabled${C_RESET}"
 
+        # Align Plugged In status to show Red 'No' when protection disables charging
+        local ui_plugged="No"
+        local plugged_color="${C_RED}"
+        if is_plugged_in && [ "$(get_charging_state)" != "Disabled" ]; then
+            ui_plugged="Yes"
+            plugged_color="${C_GREEN}"
+        fi
+
         clear
         echo -e "${C_CYAN}====================================================${C_RESET}"
-        echo -e "${C_BOLD}   MIYABI CHARGER PROTECTOR DASHBOARD${C_RESET}"
+        echo -e "${C_BOLD}         MIYABI CHARGER PROTECTOR DASHBOARD${C_RESET}"
         echo -e "${C_CYAN}====================================================${C_RESET}"
         echo -e " ${C_BOLD}Battery Status:${C_RESET}"
         echo -e "   Level       : ${C_GREEN}${level}%${C_RESET} (${status})"
         echo -e "   Temp        : ${temp}°C"
         echo -e "   Voltage     : ${vol}V"
         echo -e "   Current     : ${curr}mA"
-        echo -e "   Plugged In  : $(is_plugged_in && echo -e "${C_GREEN}Yes${C_RESET}" || echo -e "${C_RED}No${C_RESET}")"
+        echo -e "   Plugged In  : ${plugged_color}${ui_plugged}${C_RESET}"
 
         echo -e "${C_GRAY}----------------------------------------------------${C_RESET}"
         echo -e " ${C_BOLD}Protection Engine:${C_RESET}"
@@ -470,7 +542,7 @@ show_dashboard() {
         echo -e "   Stop Level  : ${C_YELLOW}${STOP_LEVEL}%${C_RESET}"
         echo -e "   Resume Level: ${C_YELLOW}${RESUME_LEVEL}%${C_RESET}"
         echo -e "   Hide Icon   : ${h_status}"
-        echo -e "   Active Node : ${C_BLUE}${node:-None}${C_RESET} (${charge_state})"
+        echo -e "   Active Node : ${C_BLUE}$(basename "${node:-None}")${C_RESET} (${charge_state})"
         echo -e "${C_CYAN}====================================================${C_RESET}"
         echo -e " ${C_BOLD}Options:${C_RESET}"
         echo -e "  [1] Toggle Protection Engine (${p_status})"
