@@ -1,124 +1,94 @@
 # Charger Protector Miyabi Core
 
-Universal Battery Charge Protection Engine untuk Android (Magisk Module) yang dirancang agar hemat daya dan performa tinggi tanpa menyebabkan lag pada sistem.
+Universal Battery Charge Protection Engine for Android (Magisk Module), designed to prevent battery degradation through intelligent charge capping, offering premium performance, low overhead, and no system lag.
 
-## Fitur Utama
+## Key Features
 
-- **Lightweight Daemon**: Menggunakan shell builtins (`read -r`) untuk memantau kapasitas baterai tanpa memicu spawn process eksternal (`cat`) terus menerus.
-- **Smart State Writer**: Hanya menulis ke file sysfs jika status pengisian daya berubah, menjaga kestabilan kernel dan meminimalkan logcat spam.
-- **Hysteresis Protection**: Otomatis menghentikan pengisian daya saat mencapai batas atas (default: 90%) dan melanjutkan pengisian setelah turun ke batas bawah (default: 70%).
-- **Interactive CLI Dashboard**: Tampilan visual dashboard premium langsung dari Terminal Android (Termux/Terminal Emulator).
-- **Manual Control Override**: Memungkinkan pengguna memaksa charging aktif/nonaktif secara manual (seperti fitur Scene 5).
-- **JSON Status API**: Output JSON satu baris yang siap di-parse oleh aplikasi monitoring buatan Anda sendiri.
-
----
-
-## Cara Install
-
-1. Pilih semua file dalam folder project ini, lalu kompres/zip menjadi sebuah file zip (misalnya `miyabi-charger.zip`).
-2. Kirim zip tersebut ke perangkat Android Anda.
-3. Buka aplikasi **Magisk**, masuk ke menu **Modules**, ketuk **Install from storage**, lalu pilih file zip tersebut.
-4. Reboot/restart HP Anda.
+- **Lightweight Daemon**: Written in pure POSIX-compliant shell script with low memory footprint and zero CPU overhead.
+- **Qualcomm Snapdragon Loop Prevention**: Uses hardware-level VBUS voltage and USB present status sensors to prevent infinite disconnect/connect loops when charging is cut off.
+- **Strict Replug Blocking**: Once charge limit is reached, charging remains blocked even if the charger is unplugged and plugged back in, unless the battery level drops below the resume threshold.
+- **Instant Configuration Application**: Uses Unix signals (`SIGUSR1`) to immediately interrupt daemon sleep cycles and apply new thresholds in milliseconds when updated via terminal or app.
+- **Smart Sleep Engine**: Uses dynamic polling frequencies (15s when plugged in, 45s when unplugged) to conserve device resources.
+- **Interactive CLI Dashboard**: Beautifully formatted terminal dashboard with battery diagnostics (temperature, voltage, current) and control settings.
+- **JSON API Support**: Out-of-the-box JSON status formatting for seamless integration with custom Android companion/monitoring applications.
 
 ---
 
-## Cara Menggunakan via Terminal Android
+## Installation
 
-Buka aplikasi terminal pilihan Anda (Termux atau Terminal Emulator), ketik `su` untuk meminta hak akses root, lalu jalankan perintah `miyabi-charger`.
+1. Package the module files into a standard `.zip` archive (do not include development files like `.git`, `README.md`, `changelog.txt`, or `update.json`).
+2. Transfer the `.zip` archive to your Android device.
+3. Flash the package via **Magisk App** or **KernelSU**.
+4. Reboot your device to start the daemon service.
 
-### 1. Dashboard Interaktif (Menu Visual)
-Cukup ketik perintah berikut tanpa argumen tambahan:
+---
+
+## CLI Usage
+
+Gain root shell access and run `miyabi-charger` with the following parameters:
+
 ```bash
+# Open the interactive visual dashboard
 su -c miyabi-charger
+
+# Get current status in raw JSON format (ideal for companion apps)
+su -c miyabi-charger status-json
+
+# Set charging stop threshold (e.g. 90%)
+su -c miyabi-charger set-stop 90
+
+# Set charging resume threshold (e.g. 70%)
+su -c miyabi-charger set-resume 70
+
+# Enable automatic charge protection engine
+su -c miyabi-charger enable
+
+# Disable automatic charge protection engine
+su -c miyabi-charger disable
+
+# Manually force charge (ignores limit temporarily)
+su -c miyabi-charger force-charge
+
+# Manually force stop charging (keeps charging suspended)
+su -c miyabi-charger force-stop
+
+# Revert manual override back to automatic protection mode
+su -c miyabi-charger auto
 ```
-Anda akan disuguhkan menu interaktif untuk memantau kondisi baterai, mengaktifkan/menonaktifkan engine, mengatur persentase batas pengisian, melakukan uji coba toggle node charging, dan melihat log engine.
-
-### 2. Mengatur Custom Stop & Resume Limit (CLI Command)
-Anda bisa mengatur batas pengisian secara langsung lewat baris perintah:
-
-- **Mengatur batas stop charging** (misalnya di 85%):
-  ```bash
-  su -c miyabi-charger set-stop 85
-  ```
-- **Mengatur batas resume charging** (misalnya di 65%):
-  ```bash
-  su -c miyabi-charger set-resume 65
-  ```
-*Catatan: Nilai Stop harus lebih besar dari nilai Resume.*
-
-### 3. Kontrol Manual (Manual Override)
-Jika ingin mengabaikan mode otomatis dan mengontrol pengisian daya secara paksa:
-- **Paksa stop charging (tidak mengisi daya)**:
-  ```bash
-  su -c miyabi-charger force-stop
-  ```
-- **Paksa charging aktif kembali**:
-  ```bash
-  su -c miyabi-charger force-resume
-  ```
-- **Kembali ke mode otomatis (berdasarkan batas persentase)**:
-  ```bash
-  su -c miyabi-charger auto
-  ```
-
-### 4. Mengaktifkan / Menonaktifkan Proteksi
-- **Mengaktifkan sistem proteksi**:
-  ```bash
-  su -c miyabi-charger enable
-  ```
-- **Menonaktifkan sistem proteksi** (HP akan dicharge seperti biasa sampai 100%):
-  ```bash
-  su -c miyabi-charger disable
-  ```
-
-### 5. Mengatur Custom Charging Node (Jalur Kontrol Kustom)
-Secara bawaan, engine akan mendeteksi node pengontrol arus yang cocok secara otomatis. Namun, jika Anda ingin menyetel jalur file kontrol daya kustom secara manual (misalnya untuk kernel kustom):
-
-1. Buka dashboard utama:
-   ```bash
-   su -c miyabi-charger
-   ```
-2. Pilih menu **`5`** (`Diagnose / Select Charge Node`).
-3. Pilih opsi **`C`** (`Custom Node Path Input`).
-4. Masukkan jalur file kontrol daya HP Anda.
-
-**Contoh Jalur Node Umum:**
-* **Qualcomm Snapdragon**: `/sys/class/power_supply/battery/charging_enabled`
-* **MediaTek Bypass**: `/proc/mtk_battery_cmd/current_cmd`
-* **MediaTek/Xiaomi Alternatif**: `/sys/class/power_supply/battery/disable`
-* **Sony/Asus**: `/sys/class/power_supply/battery/input_suspend`
-
-*Tip: Anda bisa menggunakan menu **`T`** (`Run Node Toggle Test`) di dalam submenu tersebut untuk menguji secara langsung apakah jalur kustom yang Anda masukkan bekerja memutus arus pengisian atau tidak.*
 
 ---
 
-## Integrasi dengan Aplikasi Monitoring (JSON API)
+## JSON API Output Sample
 
-Jika Anda ingin membuat aplikasi monitor (GUI) Android untuk menghubungkannya ke modul ini, aplikasi Anda cukup mengeksekusi perintah berikut untuk mendapatkan data baterai dan status modul secara lengkap:
+Calling `su -c miyabi-charger status-json` returns a lightweight JSON payload:
 
-```bash
-su -c miyabi-charger status-json
-```
-
-**Contoh Response JSON:**
 ```json
 {
-  "battery_level": 71,
+  "battery_level": 85,
   "battery_status": "Discharging",
-  "temperature_c": 35.8,
-  "voltage_v": 4.055,
-  "current_ma": -351,
-  "cycle_count": 421,
-  "node_path": "/sys/class/power_supply/battery/charging_enabled",
+  "temperature_c": 34,
+  "voltage_v": 4.15,
+  "current_ma": -240,
+  "cycle_count": 120,
+  "node_path": "/sys/class/power_supply/battery/input_suspend",
   "node_value": 1,
-  "charging_state": "Enabled",
+  "charging_state": "Disabled",
   "protection_enabled": 1,
   "stop_level": 90,
   "resume_level": 70,
   "manual_control": 0,
-  "manual_state": 1,
+  "manual_state": 0,
   "daemon_running": 1,
-  "plugged_in": 1
+  "plugged_in": 1,
+  "hide_icon": 0
 }
 ```
-Aplikasi Anda tinggal melakukan parsing pada string JSON satu baris di atas untuk memperbarui tampilan UI aplikasi monitor Anda secara real-time.
+
+---
+
+## File Structure
+
+- [system/bin/miyabi-charger](file:///C:/Ghost%20Toolbox/Video/charger-protector-miyabi-core/system/bin/miyabi-charger) : Main CLI and background daemon executable.
+- [config/default.conf](file:///C:/Ghost%20Toolbox/Video/charger-protector-miyabi-core/config/default.conf) : Default configuration template.
+- [service.sh](file:///C:/Ghost%20Toolbox/Video/charger-protector-miyabi-core/service.sh) : Starts the background daemon during boot.
+- [post-fs-data.sh](file:///C:/Ghost%20Toolbox/Video/charger-protector-miyabi-core/post-fs-data.sh) : Initializes directories and default configuration under `/data/adb/miyabi-core/charger/`.

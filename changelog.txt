@@ -1,11 +1,10 @@
-『 Charger Protector Miyabi Core v1.5.7 』
+『 Charger Protector Miyabi Core v2.0.0 』
 
-v1.5.7
-- Added MediaTek (MTK) charge control bypass support (/proc/mtk_battery_cmd/current_cmd)
-- Added support for /sys/class/power_supply/battery/disable control node
-- Added Status Bar charging icon hiding feature using dumpsys battery set usb 0
-- Implemented state cache (ICON_MOCKED) to prevent CPU lag from redundant dumpsys calls
-- Added Option [7] to toggle status bar icon visibility in CLI Dashboard
-- Optimized daemon loop using shell builtins (read -r) for zero-lag background execution
-- Fixed MODPATH directory referencing issues during module startup
-- Forced fresh node re-detection on module boot by clearing cache
+v2.0.0
+- Fixed charging disconnect-connect loop issue on Snapdragon chipsets (Poco M3).
+- Optimized charger status detection using physical connection (present) and USB voltage sensors.
+- Improved replug logic to prevent temporary charging upon cable reconnection (direct bypass).
+- Implemented instant settings application (SIGUSR1 signal) without daemon loop delays.
+- Center-aligned the CLI Dashboard title for better presentation.
+- Shortened the Active Node display using its base filename to prevent text wrapping.
+- Fixed Plugged In status indicator to display red (No) when protection is active on MediaTek devices.
