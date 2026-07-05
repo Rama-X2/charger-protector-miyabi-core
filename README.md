@@ -1,4 +1,4 @@
-# Charger Protector Miyabi Core
+# 🌸 Charger Protector Miyabi Core
 
 Universal Battery Charge Protection Engine for Android (Magisk Module), designed to prevent battery degradation through intelligent charge capping, offering premium performance, low overhead, and no system lag.
 
