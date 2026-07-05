@@ -6,6 +6,7 @@ Universal Battery Charge Protection Engine for Android (Magisk Module), designed
 
 - **Lightweight Daemon**: Written in pure POSIX-compliant shell script with low memory footprint and zero CPU overhead.
 - **Qualcomm Snapdragon Loop Prevention**: Uses hardware-level VBUS voltage and USB present status sensors to prevent infinite disconnect/connect loops when charging is cut off.
+- **Battery Freeze Prevention (v2.4.0+)**: Automatically releases `dumpsys` overrides when unplugged to ensure instant, real-time battery percentage updates on the status bar.
 - **Strict Replug Blocking**: Once charge limit is reached, charging remains blocked even if the charger is unplugged and plugged back in, unless the battery level drops below the resume threshold.
 - **Instant Configuration Application**: Uses Unix signals (`SIGUSR1`) to immediately interrupt daemon sleep cycles and apply new thresholds in milliseconds when updated via terminal or app.
 - **Smart Sleep Engine**: Uses dynamic polling frequencies (15s when plugged in, 45s when unplugged) to conserve device resources.
@@ -58,6 +59,20 @@ su -c miyabi-charger auto
 
 ---
 
+## Custom Charging Node
+
+By default, the engine automatically detects the most compatible charge control node on your device. If your device requires a specific node or if you want to use a custom node, you can easily configure it via the CLI:
+
+1. Open the interactive dashboard: `su -c miyabi-charger`.
+2. Select Option `[5] Diagnose / Select Charge Node`.
+3. Choose one of the detected compatible nodes from the list, or select option `[C] Custom Node Path Input` to manually input an absolute path.
+   - *Example Snapdragon path*: `/sys/class/power_supply/battery/input_suspend`
+   - *Example MediaTek path*: `/proc/mtk_battery_cmd/current_cmd`
+
+Alternatively, you can configure it manually by adding `NODE_PATH="/your/custom/node/path"` to the configuration file at `/data/adb/miyabi-core/charger/config.conf`.
+
+---
+
 ## JSON API Output Sample
 
 Calling `su -c miyabi-charger status-json` returns a lightweight JSON payload:
@@ -88,7 +103,7 @@ Calling `su -c miyabi-charger status-json` returns a lightweight JSON payload:
 
 ## File Structure
 
-- [system/bin/miyabi-charger](file:///C:/Ghost%20Toolbox/Video/charger-protector-miyabi-core/system/bin/miyabi-charger) : Main CLI and background daemon executable.
-- [config/default.conf](file:///C:/Ghost%20Toolbox/Video/charger-protector-miyabi-core/config/default.conf) : Default configuration template.
-- [service.sh](file:///C:/Ghost%20Toolbox/Video/charger-protector-miyabi-core/service.sh) : Starts the background daemon during boot.
-- [post-fs-data.sh](file:///C:/Ghost%20Toolbox/Video/charger-protector-miyabi-core/post-fs-data.sh) : Initializes directories and default configuration under `/data/adb/miyabi-core/charger/`.
+- [system/bin/miyabi-charger](file:///C:/Ghost%20Toolbox/Youtube%20Video/charger-protector-miyabi-core-v2.0.0/system/bin/miyabi-charger) : Main CLI and background daemon executable.
+- [config/default.conf](file:///C:/Ghost%20Toolbox/Youtube%20Video/charger-protector-miyabi-core-v2.0.0/config/default.conf) : Default configuration template.
+- [service.sh](file:///C:/Ghost%20Toolbox/Youtube%20Video/charger-protector-miyabi-core-v2.0.0/service.sh) : Starts the background daemon during boot.
+- [post-fs-data.sh](file:///C:/Ghost%20Toolbox/Youtube%20Video/charger-protector-miyabi-core-v2.0.0/post-fs-data.sh) : Initializes directories and default configuration under `/data/adb/miyabi-core/charger/`.

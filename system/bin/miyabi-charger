@@ -194,7 +194,7 @@ set_charging_state() {
 
     # Trigger status bar icon mock if write was successful
     if [ $write_success -eq 0 ]; then
-        if [ "$target_state" = "disable" ]; then
+        if [ "$target_state" = "disable" ] && is_plugged_in; then
             hide_charging_icon
         else
             show_charging_icon
@@ -468,12 +468,22 @@ run_daemon() {
                 set_charging_state "disable"
             elif [ "$cap" -le "$RESUME_LEVEL" ]; then
                 set_charging_state "enable"
+            else
+                # Maintain correct icon mock state when plugged in between thresholds
+                if [ "$(get_charging_state)" = "Disabled" ]; then
+                    hide_charging_icon
+                else
+                    show_charging_icon
+                fi
             fi
             sleep_interruptible "$SLEEP_PLUGGED"
         else
             # Unplugged:
+            # Always restore icon and unfreeze percentage reporting while unplugged
+            show_charging_icon
+            
             # ONLY enable charging if capacity drops to or below RESUME_LEVEL.
-            # Otherwise, keep current state (don't force enable) to prevent reconnect charging.
+            # Otherwise, keep current node state (don't force enable) to prevent reconnect charging.
             if [ "$cap" -le "$RESUME_LEVEL" ]; then
                 set_charging_state "enable"
             fi

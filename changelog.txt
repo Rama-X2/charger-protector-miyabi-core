@@ -1,4 +1,9 @@
-『 Charger Protector Miyabi Core v2.0.0 』
+『 Charger Protector Miyabi Core v2.4.0 』
+
+v2.4.0
+- Fixed battery percentage freezing/stuck issue when unplugged (restores dumpsys mock immediately).
+- Synchronized battery status icon mock correctly when plugged in between thresholds.
+- Bumped version to v2.4.0.
 
 v2.0.0
 - Fixed charging disconnect-connect loop issue on Snapdragon chipsets (Poco M3).
