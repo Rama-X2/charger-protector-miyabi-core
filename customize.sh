@@ -1,8 +1,7 @@
+#!/system/bin/sh
 # Copyright (C) 2026 Rama-X2
 # Licensed under the GNU General Public License, Version 3.0
 # Source: https://github.com/Rama-X2/charger-protector-miyabi-core
-
-#!/system/bin/sh
 
 print_modname() {
   ui_print "======================================================"
@@ -21,17 +20,23 @@ print_modname() {
   ui_print "           ║           (≧◡≦)          ║              "
   ui_print "           ║        Miyabi Core       ║              "
   ui_print "           ╚══════════════════════╝               "
-  busybox sleep 1  
+  busybox sleep 1
   ui_print "                      ／l、                          "
   ui_print "                    （ﾟ､ ｡ ７                        "
   ui_print "                     l、  ~ヽ                        "
   ui_print "                     じしf_, )ノ                     "
   busybox sleep 1
-  ui_print "    『 Charger Protector Miyabi Core v2.0.0 』     "
+  ui_print "    『 Charger Protector Miyabi Core v2.5.0 』     "
   busybox sleep 1
   ui_print "⢀⢀⢀⢀⢀⢀⢀⢀⢀⢀⢀⢀⢀⢀⢀⢀⢀⢀⢀⢀⢀⢀⢀⢀⢀⢀⢀⢀⢀⢀⢀⢀⢀⢀⢀⢀⢀⢀⢀"
   busybox sleep 1
   ui_print " - Initializing Runtime Engine..."
+  rm -f /data/adb/miyabi-core/charger/node.cache \
+        /data/adb/miyabi-core/charger/node.bad \
+        /data/adb/miyabi-core/charger/mock.state \
+        /data/adb/miyabi-core/charger/paused.state \
+        /data/adb/miyabi-core/charger/orig_current.state \
+        /data/adb/miyabi-core/charger/daemon.pid
   busybox sleep 1
   ui_print " - Setting executable permissions..."
   set_perm_recursive "$MODPATH/system/bin" 0 0 0755 0755

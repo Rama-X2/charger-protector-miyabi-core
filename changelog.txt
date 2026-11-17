@@ -1,4 +1,14 @@
-『 Charger Protector Miyabi Core v2.4.0 』
+『 Charger Protector Miyabi Core v2.5.0 』
+
+v2.5.0
+- Fixed persistent battery percentage freezing caused by internal BMS/main/VBUS noise false positives in cable detection (Poco M3, Redmi 10A, and other devices).
+- Kept Android SystemUI battery level synced live via `dumpsys battery set -f level` while charging icon mock is active so UI percentage never freezes while plugged in or after unplugging.
+- Persisted `dumpsys` mock state across CLI/daemon processes so `force-charge`, `disable`, and dashboard toggles always unfreeze BatteryService cleanly.
+- Added Xiaomi / MediaTek Dimensity / HyperOS 2 (Android 15) charge-control nodes (`qcom-battery`, `mtk-master-charger`, `night_charging`, `en_power_path`, `constant_charge_current_max`, `usb/input_suspend`, etc.) and fixed `charge_control_limit` polarity.
+- Added live hardware verification and automatic node failover when a kernel switch fails or gets overridden by thermal daemons (`mi_thermald`), with hysteresis pause tracking across plug/unplug cycles.
+- Added boot-completion wait and single-instance PID lock in daemon startup for GKI kernels & Magisk v27-v31+.
+- Fixed `status-json` invalid JSON formatting on MediaTek string nodes (`current_cmd`) and `N/A` sensor fallbacks.
+- Added `force-charge` alias matching documentation alongside `force-resume`, and unified full candidate node listing in CLI Diagnostic Menu `[5]`.
 
 v2.4.0
 - Fixed battery percentage freezing/stuck issue when unplugged (restores dumpsys mock immediately).

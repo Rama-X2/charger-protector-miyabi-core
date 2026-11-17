@@ -7,6 +7,11 @@
 BASE="/data/adb/miyabi-core/charger"
 CONFIG="$BASE/config.conf"
 CACHE="$BASE/node.cache"
+BAD_CACHE="$BASE/node.bad"
+MOCK_FLAG="$BASE/mock.state"
+PAUSED_FLAG="$BASE/paused.state"
+ORIG_CURR_FILE="$BASE/orig_current.state"
+PID_FILE="$BASE/daemon.pid"
 LOG="$BASE/log.txt"
 
 # Default config fallback
@@ -33,23 +38,58 @@ C_GRAY="\033[0;90m"
 # Ensure BASE directory exists
 mkdir -p "$BASE"
 
-# Helper to read sysfs safely
+# Runtime state (in-memory + synced via disk flags)
+ICON_MOCKED=0
+LAST_MOCKED_LEVEL=""
+SLEEP_PID=""
+
+# Pure POSIX integer validation (accepts positive, zero, or negative integers)
+is_int() {
+    case "$1" in
+        ''|-) return 1 ;;
+        -*)
+            case "${1#-}" in
+                *[!0-9]*) return 1 ;;
+                *) return 0 ;;
+            esac
+            ;;
+        *[!0-9]*) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
+# Detect dumpsys -f (force immediate broadcast) support (Android 8.0+ / SDK >= 26)
+DUMPSYS_F=""
+_sdk_ver=$(getprop ro.build.version.sdk 2>/dev/null)
+if is_int "$_sdk_ver" && [ "$_sdk_ver" -ge 26 ]; then
+    DUMPSYS_F="-f"
+fi
+
+# Helper to read sysfs/procfs safely without stderr spam
 read_sysfs() {
     local val=""
     if [ -f "$1" ]; then
-        read -r val < "$1"
+        read -r val < "$1" 2>/dev/null
     fi
     echo "$val"
 }
 
-# Load config
+# Load config with integer sanitization fallbacks
 load_config() {
     if [ -f "$CONFIG" ]; then
         . "$CONFIG"
     fi
+    is_int "$STOP_LEVEL" || STOP_LEVEL=90
+    is_int "$RESUME_LEVEL" || RESUME_LEVEL=70
+    is_int "$ENABLED" || ENABLED=1
+    is_int "$SLEEP_PLUGGED" || SLEEP_PLUGGED=15
+    is_int "$SLEEP_UNPLUGGED" || SLEEP_UNPLUGGED=45
+    is_int "$MANUAL_CONTROL" || MANUAL_CONTROL=0
+    is_int "$MANUAL_STATE" || MANUAL_STATE=1
+    is_int "$HIDE_ICON" || HIDE_ICON=1
 }
 
-# Save config
+# Save config and notify daemon
 save_config() {
     cat <<EOF > "$CONFIG"
 STOP_LEVEL=$STOP_LEVEL
@@ -63,12 +103,21 @@ NODE_PATH="$NODE_PATH"
 HIDE_ICON=$HIDE_ICON
 EOF
     chmod 644 "$CONFIG"
-    
-    # Notify daemon to reload and apply settings instantly
+
+    # Notify running daemon to reload and apply settings immediately
+    if [ -f "$PID_FILE" ]; then
+        local dpid=""
+        read -r dpid < "$PID_FILE" 2>/dev/null
+        if is_int "$dpid" && [ "$dpid" -ne "$$" ] && kill -0 "$dpid" 2>/dev/null; then
+            kill -USR1 "$dpid" 2>/dev/null
+            return
+        fi
+    fi
+
     local pid
-    pid=$(pgrep -f "miyabi-charger daemon")
+    pid=$(pgrep -f "miyabi-charger daemon" 2>/dev/null)
     for p in $pid; do
-        if [ "$p" -ne "$$" ]; then
+        if is_int "$p" && [ "$p" -ne "$$" ]; then
             kill -USR1 "$p" 2>/dev/null
         fi
     done
@@ -77,13 +126,64 @@ EOF
 # Log helper
 log_msg() {
     echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "$LOG"
-    # Keep log file size reasonable (max 1000 lines)
     if [ "$(wc -l < "$LOG" 2>/dev/null || echo 0)" -gt 1000 ]; then
         tail -n 500 "$LOG" > "${LOG}.tmp" && mv "${LOG}.tmp" "$LOG"
     fi
 }
 
-# Robust Charging Node Finder
+# Ordered list of candidate charge control nodes across Qualcomm, MediaTek, and OEM kernels
+get_candidate_nodes() {
+    echo "\
+/sys/class/qcom-battery/input_suspend
+/sys/class/power_supply/battery/input_suspend
+/sys/class/power_supply/usb/input_suspend
+/sys/class/power_supply/ac/input_suspend
+/sys/class/power_supply/mtk-master-charger/input_suspend
+/sys/class/power_supply/battery/charging_enabled
+/sys/class/power_supply/battery/battery_charging_enabled
+/sys/class/power_supply/mtk-master-charger/charging_enabled
+/sys/class/power_supply/usb/charging_enabled
+/sys/class/power_supply/battery/night_charging
+/sys/class/qcom-battery/night_charging
+/sys/class/power_supply/battery/stop_charging
+/sys/class/power_supply/battery/charge_disable
+/sys/class/power_supply/battery/op_charging_enabled
+/sys/class/power_supply/battery/op_disable_charge
+/sys/class/power_supply/battery/mmi_charging_enable
+/sys/class/power_supply/battery/store_mode
+/sys/class/power_supply/battery/batt_slate_mode
+/sys/class/power_supply/battery/disable
+/proc/mtk_battery_cmd/current_cmd
+/proc/mtk_battery_cmd/en_power_path
+/sys/class/power_supply/mtk-master-charger/constant_charge_current_max
+/sys/class/power_supply/battery/constant_charge_current_max
+/sys/class/power_supply/battery/constant_charge_current
+/sys/class/power_supply/battery/charge_control_limit"
+}
+
+# Check if node was marked non-functional during failover
+is_bad_node() {
+    local target="$1"
+    [ -f "$BAD_CACHE" ] || return 1
+    while IFS= read -r bad || [ -n "$bad" ]; do
+        [ "$bad" = "$target" ] && return 0
+    done < "$BAD_CACHE"
+    return 1
+}
+
+# Validate special node requirements before selecting it automatically
+is_node_usable() {
+    local node="$1"
+    [ -f "$node" ] || return 1
+    if [ "$(basename "$node")" = "charge_control_limit" ]; then
+        local max_val
+        max_val=$(read_sysfs "$(dirname "$node")/charge_control_limit_max")
+        is_int "$max_val" && [ "$max_val" -gt 0 ] || return 1
+    fi
+    return 0
+}
+
+# Robust Charging Node Finder (respects custom NODE_PATH, cache, and bad-node blacklist)
 find_node() {
     if [ -n "$NODE_PATH" ] && [ -f "$NODE_PATH" ]; then
         echo "$NODE_PATH"
@@ -91,27 +191,15 @@ find_node() {
     fi
     if [ -f "$CACHE" ]; then
         local cached_node=""
-        read -r cached_node < "$CACHE"
-        if [ -n "$cached_node" ] && [ -f "$cached_node" ]; then
+        read -r cached_node < "$CACHE" 2>/dev/null
+        if [ -n "$cached_node" ] && is_node_usable "$cached_node" && ! is_bad_node "$cached_node"; then
             echo "$cached_node"
             return
         fi
     fi
 
-    # Scan list of potential sysfs/procfs charge control nodes in order of reliability
-    for node in \
-        /proc/mtk_battery_cmd/current_cmd \
-        /sys/class/power_supply/battery/charging_enabled \
-        /sys/class/power_supply/battery/input_suspend \
-        /sys/class/power_supply/battery/battery_charging_enabled \
-        /sys/class/power_supply/battery/charge_disable \
-        /sys/class/power_supply/battery/op_charging_enabled \
-        /sys/class/power_supply/battery/mmi_charging_enable \
-        /sys/class/power_supply/battery/store_mode \
-        /sys/class/power_supply/battery/charge_control_limit \
-        /sys/class/power_supply/battery/disable
-    do
-        if [ -f "$node" ]; then
+    for node in $(get_candidate_nodes); do
+        if is_node_usable "$node" && ! is_bad_node "$node"; then
             echo "$node" > "$CACHE"
             echo "$node"
             return
@@ -119,7 +207,7 @@ find_node() {
     done
 }
 
-# Get Node Expected Values
+# Get Node Expected Values for "enable" or "disable"
 get_node_values() {
     local node="$1"
     local state="$2" # "enable" or "disable"
@@ -127,11 +215,47 @@ get_node_values() {
         current_cmd)
             [ "$state" = "disable" ] && echo "0 1" || echo "0 0"
             ;;
-        input_suspend|charge_disable|store_mode|disable)
+        en_power_path)
+            [ "$state" = "disable" ] && echo "0" || echo "1"
+            ;;
+        input_suspend|charge_disable|store_mode|disable|stop_charging|night_charging|op_disable_charge|batt_slate_mode)
             [ "$state" = "disable" ] && echo "1" || echo "0"
             ;;
-        charging_enabled|battery_charging_enabled|op_charging_enabled|mmi_charging_enable|charge_control_limit)
+        charging_enabled|battery_charging_enabled|op_charging_enabled|mmi_charging_enable)
             [ "$state" = "disable" ] && echo "0" || echo "1"
+            ;;
+        constant_charge_current_max|constant_charge_current)
+            if [ "$state" = "disable" ]; then
+                local cur_val
+                cur_val=$(read_sysfs "$node")
+                if is_int "$cur_val" && [ "$cur_val" -gt 0 ] && [ ! -f "$ORIG_CURR_FILE" ]; then
+                    echo "$cur_val" > "$ORIG_CURR_FILE"
+                fi
+                echo "0"
+            else
+                local saved_val=""
+                [ -f "$ORIG_CURR_FILE" ] && read -r saved_val < "$ORIG_CURR_FILE" 2>/dev/null
+                if is_int "$saved_val" && [ "$saved_val" -gt 0 ]; then
+                    echo "$saved_val"
+                else
+                    local bat_vol
+                    bat_vol=$(read_sysfs /sys/class/power_supply/battery/voltage_now)
+                    if is_int "$bat_vol" && [ "$bat_vol" -ge 1000 ] && [ "$bat_vol" -le 20000 ]; then
+                        echo "3000"
+                    else
+                        echo "3000000"
+                    fi
+                fi
+            fi
+            ;;
+        charge_control_limit)
+            if [ "$state" = "disable" ]; then
+                local max_val
+                max_val=$(read_sysfs "$(dirname "$node")/charge_control_limit_max")
+                is_int "$max_val" && [ "$max_val" -gt 0 ] && echo "$max_val" || echo "1"
+            else
+                echo "0"
+            fi
             ;;
         *)
             [ "$state" = "disable" ] && echo "0" || echo "1"
@@ -139,31 +263,84 @@ get_node_values() {
     esac
 }
 
-# Keep track of mocked state in memory to avoid redundant dumpsys execution
-ICON_MOCKED=0
-
-hide_charging_icon() {
-    [ "$HIDE_ICON" -ne 1 ] && return
-    if [ "$ICON_MOCKED" -ne 1 ]; then
-        dumpsys battery set usb 0 >/dev/null 2>&1
-        dumpsys battery set ac 0 >/dev/null 2>&1
-        dumpsys battery set wireless 0 >/dev/null 2>&1
-        ICON_MOCKED=1
-        log_msg "Charging status bar icon hidden via dumpsys"
+dumpsys_reset() {
+    if [ -n "$DUMPSYS_F" ]; then
+        dumpsys battery reset -f >/dev/null 2>&1 || dumpsys battery reset >/dev/null 2>&1
+    else
+        dumpsys battery reset >/dev/null 2>&1
     fi
 }
 
+dumpsys_set_level() {
+    local lvl="$1"
+    is_int "$lvl" || return
+    if [ -n "$DUMPSYS_F" ]; then
+        dumpsys battery set -f level "$lvl" >/dev/null 2>&1 || dumpsys battery set level "$lvl" >/dev/null 2>&1
+    else
+        dumpsys battery set level "$lvl" >/dev/null 2>&1
+    fi
+}
+
+# Hide charging bolt icon while KEEPING live battery percentage synced in SystemUI
+hide_charging_icon() {
+    [ "$HIDE_ICON" -ne 1 ] && return
+
+    local cap="$1"
+    if ! is_int "$cap"; then
+        cap=$(read_sysfs /sys/class/power_supply/battery/capacity)
+    fi
+    is_int "$cap" || cap=""
+
+    if [ "$ICON_MOCKED" -ne 1 ] || [ ! -f "$MOCK_FLAG" ]; then
+        dumpsys battery unplug >/dev/null 2>&1
+        dumpsys battery set ac 0 >/dev/null 2>&1
+        dumpsys battery set usb 0 >/dev/null 2>&1
+        dumpsys battery set wireless 0 >/dev/null 2>&1
+        dumpsys battery set status 3 >/dev/null 2>&1
+        ICON_MOCKED=1
+        touch "$MOCK_FLAG"
+        if [ -n "$cap" ]; then
+            dumpsys_set_level "$cap"
+            LAST_MOCKED_LEVEL="$cap"
+        fi
+        log_msg "Charging status bar icon hidden via dumpsys (level: ${cap:-unknown}%)"
+    elif [ -n "$cap" ] && [ "$cap" != "$LAST_MOCKED_LEVEL" ]; then
+        dumpsys_set_level "$cap"
+        LAST_MOCKED_LEVEL="$cap"
+    fi
+}
+
+# Restore real kernel BatteryService updates immediately
 show_charging_icon() {
-    if [ "$ICON_MOCKED" -ne 0 ]; then
-        dumpsys battery reset >/dev/null 2>&1
+    if [ "$ICON_MOCKED" -ne 0 ] || [ -f "$MOCK_FLAG" ]; then
+        dumpsys_reset
         ICON_MOCKED=0
+        LAST_MOCKED_LEVEL=""
+        rm -f "$MOCK_FLAG"
         log_msg "Charging status bar icon restored via dumpsys"
     fi
 }
 
-# Apply Charging State to Node (smart write, avoids lag/spam)
+# Write value to node safely, retrying with chmod +w once if permissions block write
+write_node_value() {
+    local node="$1"
+    local val="$2"
+
+    if echo "$val" > "$node" 2>/dev/null; then
+        return 0
+    fi
+    chmod +w "$node" 2>/dev/null
+    if echo "$val" > "$node" 2>/dev/null; then
+        return 0
+    fi
+    return 1
+}
+
+# Apply Charging State to Node (smart write, handles MTK/Qcom/OEM nodes and live UI sync)
 set_charging_state() {
     local target_state="$1" # "enable" or "disable"
+    local cap_hint="$2"
+    local force_write="${3:-0}"
     local node
     node=$(find_node)
     [ -z "$node" ] && return 1
@@ -172,18 +349,33 @@ set_charging_state() {
     expected_val=$(get_node_values "$node" "$target_state")
 
     local write_success=0
-    # Bypass comparison for proc current_cmd to ensure write success
-    if [ "$(basename "$node")" = "current_cmd" ]; then
-        echo "$expected_val" > "$node" 2>/dev/null
-        write_success=$?
+    local nbase
+    nbase=$(basename "$node")
+
+    if [ "$nbase" = "current_cmd" ]; then
+        local cur_cmd_content=""
+        cur_cmd_content=$(cat "$node" 2>/dev/null)
+        if [ "$target_state" = "disable" ]; then
+            # Always write "0 1" unless force=0 and already clearly 0 1 while not charging
+            write_node_value "$node" "$expected_val"
+            write_success=$?
+        else
+            # Only write "0 0" when needed to avoid spamming procfs when disabled/unplugged
+            if [ "$force_write" -eq 1 ] || echo "$cur_cmd_content" | grep -q "0 1" 2>/dev/null; then
+                write_node_value "$node" "$expected_val"
+                write_success=$?
+            else
+                write_success=0
+            fi
+        fi
     else
         local raw_val=""
-        read -r raw_val < "$node"
-        if [ "$raw_val" != "$expected_val" ]; then
-            echo "$expected_val" > "$node" 2>/dev/null
+        read -r raw_val < "$node" 2>/dev/null
+        if [ "$force_write" -eq 1 ] || [ "$raw_val" != "$expected_val" ]; then
+            write_node_value "$node" "$expected_val"
             write_success=$?
             if [ $write_success -eq 0 ]; then
-                log_msg "Changed charging state to $target_state (node: $(basename "$node"), val: $expected_val)"
+                log_msg "Changed charging state to $target_state (node: $nbase, val: $expected_val)"
             else
                 log_msg "Failed to write $expected_val to $node"
             fi
@@ -192,10 +384,9 @@ set_charging_state() {
         fi
     fi
 
-    # Trigger status bar icon mock if write was successful
     if [ $write_success -eq 0 ]; then
         if [ "$target_state" = "disable" ] && is_plugged_in; then
-            hide_charging_icon
+            hide_charging_icon "$cap_hint"
         else
             show_charging_icon
         fi
@@ -205,78 +396,118 @@ set_charging_state() {
     fi
 }
 
-# Check if plugged in (cable connected)
+# Check if external charger cable / wireless pad is physically connected.
+# Strictly ignores internal nodes like bms, main, parallel, fuel_gauge, mtk-gauge, etc.
 is_plugged_in() {
     local plugged=0
+    local bat_vol
+    bat_vol=$(read_sysfs /sys/class/power_supply/battery/voltage_now)
+    # Match unit scaling of kernel power_supply voltage_now (uV vs mV)
+    local vbus_thresh=3500000
+    if is_int "$bat_vol" && [ "$bat_vol" -ge 1000 ] && [ "$bat_vol" -le 20000 ]; then
+        vbus_thresh=3500
+    fi
+
     for ps in /sys/class/power_supply/*; do
         [ -d "$ps" ] || continue
         local ps_name
         ps_name=$(basename "$ps")
-        [ "$ps_name" = "battery" ] && continue
-        
-        # 1. Check online state
-        if [ -f "$ps/online" ]; then
-            read -r online < "$ps/online"
-            if [ "$online" = "1" ]; then
-                plugged=1
-                break
-            fi
+
+        local is_ext=0
+        case "$ps_name" in
+            usb|usb_pd|ac|dc|wireless|wls|charger|mtk_charger_type|mtk-charger-type|mtk-master-charger|chg|adapter)
+                is_ext=1
+                ;;
+            battery|bms|main|parallel|pc_port|fg|fuel_gauge|mtk-gauge|mtk-slave-charger|qcom-battery)
+                is_ext=0
+                ;;
+            *)
+                local ps_type
+                ps_type=$(read_sysfs "$ps/type")
+                case "$ps_type" in
+                    USB|USB_*|Mains|Wireless)
+                        is_ext=1
+                        ;;
+                esac
+                ;;
+        esac
+        [ "$is_ext" -eq 1 ] || continue
+
+        # 1. Online state (most reliable cross-platform indicator)
+        local online
+        online=$(read_sysfs "$ps/online")
+        if [ "$online" = "1" ]; then
+            plugged=1
+            break
         fi
 
-        # 2. Check present state (common on Qualcomm/Snapdragon VBUS)
-        if [ -f "$ps/present" ]; then
-            read -r present < "$ps/present"
-            if [ "$present" = "1" ]; then
-                plugged=1
-                break
-            fi
-        fi
+        # 2. Physical VBUS present / voltage fallback strictly on external ports (never bms/main!)
+        case "$ps_name" in
+            usb|usb_pd|ac|dc|wireless|wls)
+                local present
+                present=$(read_sysfs "$ps/present")
+                if [ "$present" = "1" ]; then
+                    plugged=1
+                    break
+                fi
 
-        # 3. Check voltage state as fallback (if VBUS > 4V, i.e., 4000mV or 4000000uV)
-        if [ -f "$ps/voltage_now" ] && { [ "$ps_name" = "usb" ] || [ "$ps_name" = "ac" ] || [ "$ps_name" = "main" ]; }; then
-            local vol_now=""
-            read -r vol_now < "$ps/voltage_now"
-            if [ -n "$vol_now" ] && [ "$vol_now" -gt 4000 ] 2>/dev/null; then
-                plugged=1
-                break
-            fi
-        fi
+                local vol_now
+                vol_now=$(read_sysfs "$ps/voltage_now")
+                if is_int "$vol_now" && [ "$vol_now" -ge "$vbus_thresh" ]; then
+                    plugged=1
+                    break
+                fi
+                ;;
+        esac
     done
-    
-    # Fallback to battery status only if not currently mocked
-    if [ "$plugged" -eq 0 ] && [ "$ICON_MOCKED" -ne 1 ]; then
+
+    # 3. Kernel battery/status hardware fallback (always reflects sysfs, not dumpsys mock)
+    if [ "$plugged" -eq 0 ]; then
         local status
         status=$(read_sysfs /sys/class/power_supply/battery/status)
-        if [ "$status" = "Charging" ] || [ "$status" = "Full" ]; then
+        if [ "$status" = "Charging" ]; then
             plugged=1
         fi
     fi
+
     return $(( ! plugged ))
 }
 
 # Check if daemon process is currently running
 is_daemon_running() {
+    if [ -f "$PID_FILE" ]; then
+        local dpid=""
+        read -r dpid < "$PID_FILE" 2>/dev/null
+        if is_int "$dpid" && [ "$dpid" -ne "$$" ] && kill -0 "$dpid" 2>/dev/null; then
+            return 0
+        fi
+    fi
+
     local pid
-    pid=$(pgrep -f "miyabi-charger daemon")
+    pid=$(pgrep -f "miyabi-charger daemon" 2>/dev/null)
     for p in $pid; do
-        if [ "$p" -ne "$$" ]; then
-            return 0 # Running
+        if is_int "$p" && [ "$p" -ne "$$" ]; then
+            return 0
         fi
     done
-    return 1 # Not running
+    return 1
 }
 
 # Format temperature
 get_battery_temp() {
     local raw_temp
     raw_temp=$(read_sysfs /sys/class/power_supply/battery/temp)
-    if [ -n "$raw_temp" ]; then
+    if is_int "$raw_temp"; then
         if [ "$raw_temp" -gt 1000 ]; then
-            # e.g., 35800 -> 35.8
             echo "$((raw_temp / 1000)).$(( (raw_temp % 1000) / 100 ))"
-        elif [ "$raw_temp" -gt 100 ]; then
-            # e.g., 358 -> 35.8
-            echo "$((raw_temp / 10)).$((raw_temp % 10))"
+        elif [ "$raw_temp" -gt 100 ] || [ "$raw_temp" -lt 0 ]; then
+            local abs_t="$raw_temp"
+            local sign=""
+            if [ "$abs_t" -lt 0 ]; then
+                abs_t=$(( -abs_t ))
+                sign="-"
+            fi
+            echo "${sign}$((abs_t / 10)).$((abs_t % 10))"
         else
             echo "$raw_temp"
         fi
@@ -290,11 +521,15 @@ get_battery_vol() {
     local raw_vol
     raw_vol=$(read_sysfs /sys/class/power_supply/battery/voltage_now)
     [ -z "$raw_vol" ] && raw_vol=$(read_sysfs /sys/class/power_supply/battery/batt_vol)
-    if [ -n "$raw_vol" ]; then
+    if is_int "$raw_vol"; then
         if [ "$raw_vol" -gt 10000 ]; then
-            # e.g. 4055000 -> 4.055
             local vol_dec=$((raw_vol / 1000000))
             local vol_frac=$(( (raw_vol % 1000000) / 1000 ))
+            while [ ${#vol_frac} -lt 3 ]; do vol_frac="0$vol_frac"; done
+            echo "${vol_dec}.${vol_frac}"
+        elif [ "$raw_vol" -gt 1000 ]; then
+            local vol_dec=$((raw_vol / 1000))
+            local vol_frac=$((raw_vol % 1000))
             while [ ${#vol_frac} -lt 3 ]; do vol_frac="0$vol_frac"; done
             echo "${vol_dec}.${vol_frac}"
         else
@@ -309,8 +544,8 @@ get_battery_vol() {
 get_battery_curr() {
     local raw_curr
     raw_curr=$(read_sysfs /sys/class/power_supply/battery/current_now)
-    if [ -n "$raw_curr" ]; then
-        if [ "$raw_curr" -gt 1000 ] || [ "$raw_curr" -lt -1000 ]; then
+    if is_int "$raw_curr"; then
+        if [ "$raw_curr" -gt 15000 ] || [ "$raw_curr" -lt -15000 ]; then
             echo "$((raw_curr / 1000))"
         else
             echo "$raw_curr"
@@ -325,30 +560,37 @@ get_charging_state() {
     local node
     node=$(find_node)
     [ -z "$node" ] && echo "Unknown" && return
-    
-    if [ "$(basename "$node")" = "current_cmd" ]; then
+
+    local nbase
+    nbase=$(basename "$node")
+
+    if [ "$nbase" = "current_cmd" ]; then
         local content
         content=$(cat "$node" 2>/dev/null)
         if echo "$content" | grep -q "0 1" 2>/dev/null || [ "$content" = "0 1" ]; then
             echo "Disabled"
             return
         fi
-        local curr
-        curr=$(get_battery_curr)
-        if is_plugged_in && [ "$curr" != "N/A" ] && [ "$curr" -le 10 ] && [ "$curr" -ge -50 ]; then
-             echo "Disabled"
-             return
+        local status
+        status=$(read_sysfs /sys/class/power_supply/battery/status)
+        if is_plugged_in && [ "$status" != "Charging" ]; then
+            echo "Disabled"
+            return
+        fi
+        if [ -f "$PAUSED_FLAG" ]; then
+            echo "Disabled"
+            return
         fi
         echo "Enabled"
         return
     fi
-    
+
     local val=""
-    read -r val < "$node"
-    
+    read -r val < "$node" 2>/dev/null
+
     local disabled_val
     disabled_val=$(get_node_values "$node" "disable")
-    
+
     if [ "$val" = "$disabled_val" ]; then
         echo "Disabled"
     else
@@ -356,136 +598,241 @@ get_charging_state() {
     fi
 }
 
-# JSON Status Output for Monitor App
+# JSON Status Output for Monitor App (always emits valid RFC 8259 JSON)
 print_json_status() {
     load_config
     local level
     level=$(read_sysfs /sys/class/power_supply/battery/capacity)
-    [ -z "$level" ] && level=0
-    
+    is_int "$level" || level=0
+
     local status
     status=$(read_sysfs /sys/class/power_supply/battery/status)
     [ -z "$status" ] && status="Unknown"
-    
+
     local temp
     temp=$(get_battery_temp)
-    
+    [ "$temp" = "N/A" ] && temp="null"
+
     local vol
     vol=$(get_battery_vol)
-    
+    [ "$vol" = "N/A" ] && vol="null"
+
     local curr
     curr=$(get_battery_curr)
-    
+    [ "$curr" = "N/A" ] && curr="null"
+
     local cycle
     cycle=$(read_sysfs /sys/class/power_supply/battery/cycle_count)
-    [ -z "$cycle" ] && cycle="0"
-    
+    is_int "$cycle" || cycle="0"
+
     local node
     node=$(find_node)
     [ -z "$node" ] && node="none"
-    
+
     local node_val=""
-    [ "$node" != "none" ] && read -r node_val < "$node"
-    [ -z "$node_val" ] && node_val="null"
-    
+    [ "$node" != "none" ] && read -r node_val < "$node" 2>/dev/null
+    local json_node_val="null"
+    if [ -n "$node_val" ]; then
+        if is_int "$node_val"; then
+            json_node_val="$node_val"
+        else
+            # Escape double quotes and backslashes if string
+            node_val=$(echo "$node_val" | sed 's/\\/\\\\/g; s/"/\\"/g')
+            json_node_val="\"$node_val\""
+        fi
+    fi
+
     local d_run=0
     is_daemon_running && d_run=1
-    
+
     local plugged=0
     is_plugged_in && plugged=1
-    
+
     local charging_state
     charging_state=$(get_charging_state)
 
     cat <<EOF
-{"battery_level":$level,"battery_status":"$status","temperature_c":$temp,"voltage_v":$vol,"current_ma":$curr,"cycle_count":$cycle,"node_path":"$node","node_value":$node_val,"charging_state":"$charging_state","protection_enabled":$ENABLED,"stop_level":$STOP_LEVEL,"resume_level":$RESUME_LEVEL,"manual_control":$MANUAL_CONTROL,"manual_state":$MANUAL_STATE,"daemon_running":$d_run,"plugged_in":$plugged,"hide_icon":$HIDE_ICON}
+{"battery_level":$level,"battery_status":"$status","temperature_c":$temp,"voltage_v":$vol,"current_ma":$curr,"cycle_count":$cycle,"node_path":"$node","node_value":$json_node_val,"charging_state":"$charging_state","protection_enabled":$ENABLED,"stop_level":$STOP_LEVEL,"resume_level":$RESUME_LEVEL,"manual_control":$MANUAL_CONTROL,"manual_state":$MANUAL_STATE,"daemon_running":$d_run,"plugged_in":$plugged,"hide_icon":$HIDE_ICON}
 EOF
 }
 
-# Sleep helper that can be interrupted by signals instantly
+# Sleep helper interruptible by SIGUSR1/INT/TERM without leaving orphan sleep processes
 sleep_interruptible() {
     local duration="$1"
     sleep "$duration" &
-    wait $! 2>/dev/null
+    SLEEP_PID=$!
+    wait "$SLEEP_PID" 2>/dev/null
+    if [ -n "$SLEEP_PID" ] && kill -0 "$SLEEP_PID" 2>/dev/null; then
+        kill "$SLEEP_PID" 2>/dev/null
+        wait "$SLEEP_PID" 2>/dev/null
+    fi
+    SLEEP_PID=""
+}
+
+# Enforce charging disable and auto-failover if a kernel node fails to actually stop charging
+enforce_disable_with_verify() {
+    local cap="$1"
+    local attempts=0
+
+    while true; do
+        local active_node
+        active_node=$(find_node)
+        if [ -z "$active_node" ]; then
+            # Do not hide/freeze UI icon if no working control node exists
+            show_charging_icon
+            return 1
+        fi
+
+        if ! set_charging_state "disable" "$cap"; then
+            # Write failed on this node
+            if [ -z "$NODE_PATH" ] && [ "$attempts" -lt 15 ]; then
+                log_msg "Write failed on $active_node; marking node unusable and trying next..."
+                echo "$active_node" >> "$BAD_CACHE"
+                rm -f "$CACHE"
+                attempts=$((attempts + 1))
+                continue
+            fi
+            show_charging_icon
+            return 1
+        fi
+
+        # Verify real hardware status from sysfs
+        local hw_status
+        hw_status=$(read_sysfs /sys/class/power_supply/battery/status)
+        [ "$hw_status" != "Charging" ] && return 0
+
+        # Wait briefly for PMIC/IC to settle, then check again
+        sleep_interruptible 3
+        is_plugged_in || return 0
+        hw_status=$(read_sysfs /sys/class/power_supply/battery/status)
+        [ "$hw_status" != "Charging" ] && return 0
+
+        # Thermal daemon (e.g. mi_thermald on HyperOS) or driver may have reverted the node; force re-write once
+        set_charging_state "disable" "$cap" 1
+        sleep_interruptible 3
+        is_plugged_in || return 0
+        hw_status=$(read_sysfs /sys/class/power_supply/battery/status)
+        [ "$hw_status" != "Charging" ] && return 0
+
+        # Still Charging -> current auto-detected node is ineffective on this device
+        if [ -z "$NODE_PATH" ] && [ "$attempts" -lt 15 ]; then
+            log_msg "Node $active_node left hardware status Charging; failing over to next candidate..."
+            write_node_value "$active_node" "$(get_node_values "$active_node" "enable")" >/dev/null 2>&1
+            echo "$active_node" >> "$BAD_CACHE"
+            rm -f "$CACHE"
+            attempts=$((attempts + 1))
+            continue
+        fi
+
+        # Exhausted candidates without stopping Charging -> restore UI icon so user sees truth
+        show_charging_icon
+        return 1
+    done
 }
 
 # Daemon cleanup on exit for safety
 cleanup() {
     log_msg "Daemon exiting, restoring charging and icon state..."
-    # Disable traps to prevent recursion
     trap - EXIT INT TERM USR1
-    
-    # Restore charging to enabled
+
+    if [ -n "$SLEEP_PID" ] && kill -0 "$SLEEP_PID" 2>/dev/null; then
+        kill "$SLEEP_PID" 2>/dev/null
+    fi
+
     local node
     node=$(find_node)
     if [ -n "$node" ]; then
         local expected_val
         expected_val=$(get_node_values "$node" "enable")
-        echo "$expected_val" > "$node" 2>/dev/null
+        write_node_value "$node" "$expected_val" >/dev/null 2>&1
     fi
-    
-    # Restore battery status icon
-    dumpsys battery reset >/dev/null 2>&1
+
+    dumpsys_reset
+    rm -f "$MOCK_FLAG" "$PID_FILE"
 }
 
 # The Daemon Core Loop (Low Overhead)
 run_daemon() {
+    # Prevent duplicate daemon instances
+    if [ -f "$PID_FILE" ]; then
+        local old_pid=""
+        read -r old_pid < "$PID_FILE" 2>/dev/null
+        if is_int "$old_pid" && [ "$old_pid" -ne "$$" ] && kill -0 "$old_pid" 2>/dev/null; then
+            log_msg "Daemon already running (PID: $old_pid), exiting duplicate instance (PID: $$)"
+            exit 0
+        fi
+    fi
+
+    # Wait for Android boot completion so BatteryService & vendor GKI power drivers are ready
+    local boot_wait=0
+    while [ "$(getprop sys.boot_completed 2>/dev/null)" != "1" ] && [ "$boot_wait" -lt 60 ]; do
+        sleep 2
+        boot_wait=$((boot_wait + 1))
+    done
+
+    echo "$$" > "$PID_FILE"
     log_msg "Miyabi Charger Protection daemon started (PID: $$)"
-    
-    # Register signal traps
+
+    # Ensure clean BatteryService telemetry on startup
+    dumpsys_reset
+    rm -f "$MOCK_FLAG"
+
     trap "load_config" USR1
-    trap "cleanup" EXIT INT TERM
-    
+    trap "cleanup; exit 0" EXIT INT TERM
+
     while true; do
-        # Reload configuration parameters at each iteration
         load_config
-        
+
         if [ "$ENABLED" -ne 1 ]; then
-            # If engine is disabled, ensure charging is enabled and sleep
+            rm -f "$PAUSED_FLAG"
             set_charging_state "enable"
             sleep_interruptible "$SLEEP_UNPLUGGED"
             continue
         fi
-        
+
+        local cap=""
+        cap=$(read_sysfs /sys/class/power_supply/battery/capacity)
+        is_int "$cap" || cap=0
+
         if [ "$MANUAL_CONTROL" -eq 1 ]; then
-            # Manual override mode
             if [ "$MANUAL_STATE" -eq 1 ]; then
-                set_charging_state "enable"
+                rm -f "$PAUSED_FLAG"
+                set_charging_state "enable" "$cap"
             else
-                set_charging_state "disable"
+                if is_plugged_in; then
+                    enforce_disable_with_verify "$cap"
+                else
+                    show_charging_icon
+                    set_charging_state "disable" "$cap"
+                fi
             fi
             sleep_interruptible "$SLEEP_PLUGGED"
             continue
         fi
-        
-        # Automatic protection mode
-        local cap=""
-        read -r cap < /sys/class/power_supply/battery/capacity
-        [ -z "$cap" ] && cap=0
-        
+
+        # Automatic protection mode with strict hysteresis
         if is_plugged_in; then
             if [ "$cap" -ge "$STOP_LEVEL" ]; then
-                set_charging_state "disable"
+                [ ! -f "$PAUSED_FLAG" ] && touch "$PAUSED_FLAG"
+                enforce_disable_with_verify "$cap"
             elif [ "$cap" -le "$RESUME_LEVEL" ]; then
-                set_charging_state "enable"
+                rm -f "$PAUSED_FLAG"
+                set_charging_state "enable" "$cap"
+            elif [ -f "$PAUSED_FLAG" ]; then
+                # Between RESUME and STOP while paused: keep charging blocked & keep % synced live
+                enforce_disable_with_verify "$cap"
             else
-                # Maintain correct icon mock state when plugged in between thresholds
-                if [ "$(get_charging_state)" = "Disabled" ]; then
-                    hide_charging_icon
-                else
-                    show_charging_icon
-                fi
+                # Between RESUME and STOP and not paused: allow normal charging
+                set_charging_state "enable" "$cap"
             fi
             sleep_interruptible "$SLEEP_PLUGGED"
         else
-            # Unplugged:
-            # Always restore icon and unfreeze percentage reporting while unplugged
+            # Unplugged: ALWAYS restore BatteryService so % never freezes!
             show_charging_icon
-            
-            # ONLY enable charging if capacity drops to or below RESUME_LEVEL.
-            # Otherwise, keep current node state (don't force enable) to prevent reconnect charging.
+
             if [ "$cap" -le "$RESUME_LEVEL" ]; then
-                set_charging_state "enable"
+                rm -f "$PAUSED_FLAG"
+                set_charging_state "enable" "$cap"
             fi
             sleep_interruptible "$SLEEP_UNPLUGGED"
         fi
@@ -510,10 +857,10 @@ show_dashboard() {
         node=$(find_node)
         local charge_state
         charge_state=$(get_charging_state)
-        
+
         local d_status="${C_RED}Stopped${C_RESET}"
         is_daemon_running && d_status="${C_GREEN}Running${C_RESET}"
-        
+
         local p_status="${C_RED}Disabled${C_RESET}"
         [ "$ENABLED" -eq 1 ] && p_status="${C_GREEN}Enabled${C_RESET}"
 
@@ -525,10 +872,9 @@ show_dashboard() {
         local h_status="${C_RED}Disabled${C_RESET}"
         [ "$HIDE_ICON" -eq 1 ] && h_status="${C_GREEN}Enabled${C_RESET}"
 
-        # Align Plugged In status to show Red 'No' when protection disables charging
         local ui_plugged="No"
         local plugged_color="${C_RED}"
-        if is_plugged_in && [ "$(get_charging_state)" != "Disabled" ]; then
+        if is_plugged_in && [ "$charge_state" != "Disabled" ]; then
             ui_plugged="Yes"
             plugged_color="${C_GREEN}"
         fi
@@ -566,28 +912,36 @@ show_dashboard() {
         echo -e "${C_CYAN}====================================================${C_RESET}"
         echo -n -e " Enter choice: "
         read -r choice
-        
+
         case "$choice" in
             1)
                 if [ "$ENABLED" -eq 1 ]; then
                     ENABLED=0
+                    rm -f "$PAUSED_FLAG"
                     echo "Disabling protection..."
+                    save_config
+                    set_charging_state "enable" "" 1
                 else
                     ENABLED=1
                     echo "Enabling protection..."
+                    save_config
                 fi
-                save_config
                 sleep 1
                 ;;
             2)
                 echo -n "Enter stop percentage (10-100): "
                 read -r input_stop
-                if [ "$input_stop" -ge 10 ] && [ "$input_stop" -le 100 ] 2>/dev/null; then
+                if is_int "$input_stop" && [ "$input_stop" -ge 10 ] && [ "$input_stop" -le 100 ]; then
                     if [ "$input_stop" -le "$RESUME_LEVEL" ]; then
                         echo -e "${C_RED}Error: Stop percentage must be higher than Resume percentage ($RESUME_LEVEL%).${C_RESET}"
                         read -r _
                     else
                         STOP_LEVEL=$input_stop
+                        local cur_cap
+                        cur_cap=$(read_sysfs /sys/class/power_supply/battery/capacity)
+                        if is_int "$cur_cap" && [ "$STOP_LEVEL" -gt "$cur_cap" ]; then
+                            rm -f "$PAUSED_FLAG"
+                        fi
                         save_config
                     fi
                 else
@@ -598,7 +952,7 @@ show_dashboard() {
             3)
                 echo -n "Enter resume percentage (5-95): "
                 read -r input_resume
-                if [ "$input_resume" -ge 5 ] && [ "$input_resume" -le 95 ] 2>/dev/null; then
+                if is_int "$input_resume" && [ "$input_resume" -ge 5 ] && [ "$input_resume" -le 95 ]; then
                     if [ "$input_resume" -ge "$STOP_LEVEL" ]; then
                         echo -e "${C_RED}Error: Resume percentage must be lower than Stop percentage ($STOP_LEVEL%).${C_RESET}"
                         read -r _
@@ -635,8 +989,7 @@ show_dashboard() {
                     echo "Disabling Hide Icon feature..."
                 else
                     HIDE_ICON=1
-                    # If charging is currently disabled, apply immediately
-                    if [ "$(get_charging_state)" = "Disabled" ]; then
+                    if [ "$(get_charging_state)" = "Disabled" ] && is_plugged_in; then
                         hide_charging_icon
                     fi
                     echo "Enabling Hide Icon feature..."
@@ -671,21 +1024,22 @@ show_manual_override_menu() {
         echo -e "${C_CYAN}====================================================${C_RESET}"
         echo -n " Enter choice: "
         read -r mchoice
-        
+
         case "$mchoice" in
             1)
                 MANUAL_CONTROL=1
                 MANUAL_STATE=0
                 save_config
-                set_charging_state "disable"
+                set_charging_state "disable" "" 1
                 echo "Charging force disabled."
                 sleep 1
                 ;;
             2)
                 MANUAL_CONTROL=1
                 MANUAL_STATE=1
+                rm -f "$PAUSED_FLAG"
                 save_config
-                set_charging_state "enable"
+                set_charging_state "enable" "" 1
                 echo "Charging force enabled."
                 sleep 1
                 ;;
@@ -715,90 +1069,87 @@ show_diagnostic_menu() {
         echo -e "${C_CYAN}====================================================${C_RESET}"
         echo -e " Active Node : ${C_BLUE}${current_node:-None}${C_RESET}"
         echo -e " Node Val    : $([ -n "$current_node" ] && read_sysfs "$current_node" || echo "N/A")"
+        echo -e " Custom Path : ${NODE_PATH:-Auto}"
         echo -e "${C_GRAY}----------------------------------------------------${C_RESET}"
         echo -e " Found nodes on this device:"
-        
+
         local idx=1
         local nodes_found=""
-        for n in \
-            /sys/class/power_supply/battery/charging_enabled \
-            /sys/class/power_supply/battery/input_suspend \
-            /sys/class/power_supply/battery/battery_charging_enabled \
-            /sys/class/power_supply/battery/charge_disable \
-            /sys/class/power_supply/battery/op_charging_enabled \
-            /sys/class/power_supply/battery/mmi_charging_enable \
-            /sys/class/power_supply/battery/store_mode \
-            /sys/class/power_supply/battery/charge_control_limit
-        do
-            if [ -f "$n" ]; then
+        for n in $(get_candidate_nodes); do
+            if is_node_usable "$n"; then
                 local is_active=""
                 [ "$n" = "$current_node" ] && is_active=" ${C_GREEN}(Active)${C_RESET}"
-                echo -e "  [$idx] $(basename "$n")${is_active}"
+                local tag_bad=""
+                is_bad_node "$n" && tag_bad=" ${C_RED}(Failed verify)${C_RESET}"
+                echo -e "  [$idx] $(echo "$n" | sed 's|/sys/class/||; s|/proc/||')${is_active}${tag_bad}"
                 nodes_found="$nodes_found $n"
                 idx=$((idx + 1))
             fi
         done
-        
+
         if [ "$idx" -eq 1 ]; then
             echo -e "  ${C_RED}No compatible charging nodes detected!${C_RESET}"
         fi
-        
+
         echo -e "${C_GRAY}----------------------------------------------------${C_RESET}"
-        echo -e " [T] Run Node Toggle Test (Will turn charging OFF for 5s, then ON)"
-        echo -e " [R] Reset to Auto-detected Node"
+        echo -e " [T] Run Node Toggle Test (Turns charging OFF 5s, checks Status & mA)"
+        echo -e " [R] Reset to Auto-detected Node (Clears bad-node cache)"
         echo -e " [C] Custom Node Path Input"
         echo -e " [B] Back"
         echo -e "${C_CYAN}====================================================${C_RESET}"
         echo -n " Enter index or option: "
         read -r opt
-        
+
         case "$opt" in
-            [1-9])
-                local select_idx=1
-                for n in $nodes_found; do
-                    if [ "$select_idx" -eq "$opt" ]; then
-                        NODE_PATH="$n"
-                        save_config
-                        rm -f "$CACHE"
-                        echo "Switched to node: $n"
-                        sleep 1
-                        break
-                    fi
-                    select_idx=$((select_idx + 1))
-                done
+            [0-9]*)
+                if is_int "$opt" && [ "$opt" -ge 1 ]; then
+                    local select_idx=1
+                    for n in $nodes_found; do
+                        if [ "$select_idx" -eq "$opt" ]; then
+                            NODE_PATH="$n"
+                            rm -f "$CACHE" "$BAD_CACHE"
+                            save_config
+                            echo "Switched to node: $n"
+                            sleep 1
+                            break
+                        fi
+                        select_idx=$((select_idx + 1))
+                    done
+                fi
                 ;;
             t|T)
                 if [ -n "$current_node" ]; then
-                    echo -e "\n${C_YELLOW}Testing Node Toggle:${C_RESET}"
+                    echo -e "\n${C_YELLOW}Testing Node Toggle ($current_node):${C_RESET}"
+                    echo "Before -> Status: $(read_sysfs /sys/class/power_supply/battery/status), Current: $(get_battery_curr) mA"
                     echo "1. Disabling charging for 5 seconds..."
-                    set_charging_state "disable"
+                    set_charging_state "disable" "" 1
                     sleep 5
-                    echo "Current: $(get_battery_curr) mA (should be 0 or negative)"
+                    echo "Disabled -> Status: $(read_sysfs /sys/class/power_supply/battery/status), Current: $(get_battery_curr) mA"
                     echo "2. Re-enabling charging..."
-                    set_charging_state "enable"
+                    set_charging_state "enable" "" 1
                     sleep 2
-                    echo "Current: $(get_battery_curr) mA"
+                    echo "Restored -> Status: $(read_sysfs /sys/class/power_supply/battery/status), Current: $(get_battery_curr) mA"
                     echo "Test complete. Press enter to continue."
                     read -r _
                 else
                     echo "No active node to test."
-                    sleep 15
+                    sleep 2
                 fi
                 ;;
             r|R)
                 NODE_PATH=""
-                rm -f "$CACHE"
+                rm -f "$CACHE" "$BAD_CACHE"
                 save_config
-                echo "Cleared custom node. Daemon will auto-detect."
+                echo "Cleared custom node & bad cache. Daemon will auto-detect."
                 sleep 1
                 ;;
             c|C)
-                echo -n "Enter absolute sysfs path: "
+                echo -n "Enter absolute sysfs/procfs path: "
                 read -r custom_path
                 if [ -f "$custom_path" ]; then
                     NODE_PATH="$custom_path"
+                    rm -f "$CACHE" "$BAD_CACHE"
                     save_config
-                    rm -f "$CACHE"
                     echo "Set custom node path to: $custom_path"
                 else
                     echo -e "${C_RED}File does not exist!${C_RESET}"
@@ -834,13 +1185,17 @@ case "$1" in
         print_json_status
         ;;
     set-stop)
-        if [ -n "$2" ] && [ "$2" -ge 10 ] && [ "$2" -le 100 ] 2>/dev/null; then
+        if is_int "$2" && [ "$2" -ge 10 ] && [ "$2" -le 100 ]; then
             load_config
             if [ "$2" -le "$RESUME_LEVEL" ]; then
                 echo "Error: Stop level ($2) must be greater than Resume level ($RESUME_LEVEL)."
                 exit 1
             fi
             STOP_LEVEL="$2"
+            cur_cap=$(read_sysfs /sys/class/power_supply/battery/capacity)
+            if is_int "$cur_cap" && [ "$STOP_LEVEL" -gt "$cur_cap" ]; then
+                rm -f "$PAUSED_FLAG"
+            fi
             save_config
             echo "Stop level set to $2%."
         else
@@ -849,7 +1204,7 @@ case "$1" in
         fi
         ;;
     set-resume)
-        if [ -n "$2" ] && [ "$2" -ge 5 ] && [ "$2" -le 95 ] 2>/dev/null; then
+        if is_int "$2" && [ "$2" -ge 5 ] && [ "$2" -le 95 ]; then
             load_config
             if [ "$2" -ge "$STOP_LEVEL" ]; then
                 echo "Error: Resume level ($2) must be less than Stop level ($STOP_LEVEL)."
@@ -872,7 +1227,9 @@ case "$1" in
     disable)
         load_config
         ENABLED=0
+        rm -f "$PAUSED_FLAG"
         save_config
+        set_charging_state "enable" "" 1
         echo "Miyabi Charger Protector disabled."
         ;;
     force-stop)
@@ -880,15 +1237,16 @@ case "$1" in
         MANUAL_CONTROL=1
         MANUAL_STATE=0
         save_config
-        set_charging_state "disable"
+        set_charging_state "disable" "" 1
         echo "Charging manually disabled."
         ;;
-    force-resume)
+    force-charge|force-resume)
         load_config
         MANUAL_CONTROL=1
         MANUAL_STATE=1
+        rm -f "$PAUSED_FLAG"
         save_config
-        set_charging_state "enable"
+        set_charging_state "enable" "" 1
         echo "Charging manually enabled."
         ;;
     auto)
@@ -918,11 +1276,10 @@ EOF
         echo "  set-stop <10-100>       Sets stop percentage"
         echo "  set-resume <5-95>       Sets resume percentage"
         echo "  force-stop              Force disables charging manually"
-        echo "  force-resume            Force enables charging manually"
+        echo "  force-charge            Force enables charging manually (alias: force-resume)"
         echo "  auto                    Restores automatic percentage checking"
         ;;
     *)
-        # Default: open interactive UI if in tty, otherwise show help
         if [ -t 0 ] || [ -t 1 ]; then
             show_dashboard
         else
